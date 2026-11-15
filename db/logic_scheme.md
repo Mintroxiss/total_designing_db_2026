@@ -13,8 +13,9 @@ erDiagram
         varchar apartment_office
     }
     CLIENT_ADDRESS {
-        uuid client_id PK,FK
-        uuid address_id PK,FK
+        uuid client_address_id PK
+        uuid client_id FK
+        uuid address_id FK
     }
     RESTAURANT {
         uuid restaurant_id PK
@@ -71,8 +72,7 @@ erDiagram
     ORDER {
         uuid order_id PK
         uuid courier_id FK
-        uuid client_id FK
-        uuid address_id FK
+        uuid client_address_id FK
         uuid restaurant_id FK
         timestamp order_timestamp
         timestamp delivery_timestamp
