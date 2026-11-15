@@ -26,7 +26,7 @@ create type measure_unit       as enum ('шт', 'кг', 'л');
 -- ТАБЛИЦЫ
 create table client (
     client_id    uuid default uuid_generate_v4() primary key,
-    login        varchar(50) not null unique,
+    login        varchar(50) not null unique check (login ~ '^[a-z][a-z0-9_]{2,49}$'),
     password     varchar(32) not null check(password ~ '^[0-9a-f]{32}$'),
     phone_number char(12) not null unique check(phone_number ~ '^\+79\d{9}$')
 );
