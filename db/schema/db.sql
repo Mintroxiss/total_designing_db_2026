@@ -35,7 +35,7 @@ create table address (
     address_id       uuid default uuid_generate_v4() primary key,
     street           varchar(150) not null,
     house_number     varchar(20) not null,
-    apartment_office varchar(20)
+    apartment_office varchar(20) check(apartment_office is null or btrim(apartment_office) != '')
 );
 
 create table client_address (
@@ -213,6 +213,14 @@ create unique index uq_payment_order_success
 create unique index uq_restaurant_payout_one_success
     on restaurant_payout (order_id)
     where status = 'успех';
+
+-- BR-3.3, BR-3.4
+create unique index uq_address_physical
+    on address (
+        lower(btrim(street)),
+        lower(btrim(house_number)),
+        coalesce(lower(btrim(apartment_office)), '')
+    );
 
 
 -- ФУНКЦИИ И ТРИГГЕРЫ
@@ -480,7 +488,7 @@ before insert or update of order_amount on "order"
 for each row execute function order_amount_guard();
 
 
--- BR-5.5, BR-7.3, BR-7.14, BR-7.15
+-- BR-5.5, BR-7.3, BR-7.14, BR-7.15, BR-8.4
 create function item_before() returns trigger
 language plpgsql
 set search_path = shkuratetskiy_food
@@ -507,7 +515,7 @@ begin
         or exists (
             select 1
             from payment
-            where order_id = oid and status in ('успех', 'в_обработке')
+            where order_id = oid
         )
         or exists (
             select 1
@@ -1188,6 +1196,53 @@ create trigger trg_payout_success_immutable
 before update of status on restaurant_payout
 for each row
 execute function prevent_success_transaction_change();
+
+
+-- BR-7.2, BR-7.4, BR-11.3
+create function order_parties_guard()
+returns trigger
+language plpgsql
+set search_path = shkuratetskiy_food
+as $$
+declare
+    cl uuid;
+begin
+    if tg_op = 'INSERT' or new.client_address_id is distinct from old.client_address_id then
+        if new.client_address_id is null then
+            if tg_op = 'INSERT' or pg_trigger_depth() = 1 then
+                raise exception 'У заказа должен быть адрес клиента'
+                    using errcode = 'not_null_violation';
+            end if;
+        else
+            select client_id into cl
+            from client_address
+            where client_address_id = new.client_address_id
+            for share;
+
+            if cl is null then
+                raise exception 'Адрес % не привязан к клиенту, оформить на него заказ нельзя',
+                    new.client_address_id
+                    using errcode = 'check_violation';
+            end if;
+        end if;
+    end if;
+
+    if tg_op = 'INSERT' or new.restaurant_id is distinct from old.restaurant_id then
+        if new.restaurant_id is null
+           and (tg_op = 'INSERT' or pg_trigger_depth() = 1) then
+            raise exception 'У заказа должен быть ресторан'
+                using errcode = 'not_null_violation';
+        end if;
+    end if;
+
+    return new;
+end;
+$$;
+
+create trigger trg_order_parties_guard
+    before insert or update of client_address_id, restaurant_id on "order"
+    for each row
+    execute function order_parties_guard();
 
 
 commit;
