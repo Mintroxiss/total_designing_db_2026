@@ -1,4 +1,4 @@
-create procedure shkuratetskiy_food.insert_test_data(value int)
+create or replace procedure shkuratetskiy_food.insert_test_data(value int)
 language plpgsql
 set search_path = shkuratetskiy_food, exts
 as $$
@@ -21,7 +21,7 @@ declare
     m    int;
     ms   date;
 begin
-    if n < 1 then
+    if n is null or n < 1 then
         raise exception 'value должно быть >= 1';
     end if;
 

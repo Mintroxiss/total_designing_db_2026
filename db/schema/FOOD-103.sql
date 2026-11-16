@@ -1,4 +1,4 @@
-create procedure shkuratetskiy_food.erase_test_data()
+create or replace procedure shkuratetskiy_food.erase_test_data()
 language plpgsql
 set search_path = shkuratetskiy_food, exts
 as $$

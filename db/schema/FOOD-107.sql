@@ -1,4 +1,4 @@
-create procedure shkuratetskiy_food.courier_salary()
+create or replace procedure shkuratetskiy_food.courier_salary()
 language plpgsql
 set search_path = shkuratetskiy_food, exts
 as $$

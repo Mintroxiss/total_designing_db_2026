@@ -1,4 +1,4 @@
-create procedure shkuratetskiy_food.add_product(
+create or replace procedure shkuratetskiy_food.add_product(
     p_product_name        varchar,
     p_product_category_id uuid,
     p_price               numeric,

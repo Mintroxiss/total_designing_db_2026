@@ -1,4 +1,4 @@
-create function shkuratetskiy_food.get_statistic()
+create or replace function shkuratetskiy_food.get_statistic()
 returns table (
     restaurant_name   varchar,
     best_product_name varchar,

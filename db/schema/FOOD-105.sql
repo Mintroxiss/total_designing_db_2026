@@ -2,7 +2,7 @@ begin;
 
 set local search_path to shkuratetskiy_food, exts;
 
-create function refresh_product_rating(p_id uuid)
+create or replace function refresh_product_rating(p_id uuid)
 returns void
 language plpgsql
 set search_path = shkuratetskiy_food
@@ -19,7 +19,7 @@ begin
 end;
 $$;
 
-create function refresh_restaurant_rating(r_id uuid)
+create or replace function refresh_restaurant_rating(r_id uuid)
 returns void
 language plpgsql
 set search_path = shkuratetskiy_food
@@ -36,7 +36,7 @@ begin
 end;
 $$;
 
-create function rating_change()
+create or replace function rating_change()
 returns trigger
 language plpgsql
 set search_path = shkuratetskiy_food
@@ -74,15 +74,15 @@ begin
 end;
 $$;
 
-create trigger trg_product_review_rating
+create or replace trigger trg_product_review_rating
     after insert or update of product_id, review_id or delete on product_review
     for each row execute function rating_change();
 
-create trigger trg_restaurant_review_rating
+create or replace trigger trg_restaurant_review_rating
     after insert or update of restaurant_id, review_id or delete on restaurant_review
     for each row execute function rating_change();
 
-create trigger trg_review_rating
+create or replace trigger trg_review_rating
     after update of rating on review
     for each row
     when (new.rating is distinct from old.rating)

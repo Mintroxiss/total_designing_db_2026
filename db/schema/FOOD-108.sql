@@ -1,4 +1,4 @@
-create view shkuratetskiy_food.how_much_money as
+create or replace view shkuratetskiy_food.how_much_money as
 with recursive bounds as (
     select date_trunc('month', min(delivery_timestamp))::date as first_m,
            date_trunc('month', max(delivery_timestamp))::date as last_m
