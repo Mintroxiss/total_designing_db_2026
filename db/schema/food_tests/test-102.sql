@@ -148,16 +148,20 @@ begin
 end $$;
 
 
-create function tst.bad_nulls() returns text language plpgsql as $$
+create or replace function tst.bad_nulls() returns text language plpgsql as $$
 declare
     r record;
     v_c bigint;
     res text := '';
 begin
-    for r in select table_name t, column_name col
-             from information_schema.columns
-             where table_schema = 'shkuratetskiy_food' and is_nullable = 'YES'
-               and (table_name, column_name) not in (
+    for r in select c.table_name t, c.column_name col
+             from information_schema.columns c
+             join information_schema.tables t
+               on t.table_schema = c.table_schema and t.table_name = c.table_name
+             where c.table_schema = 'shkuratetskiy_food'
+               and t.table_type = 'BASE TABLE'
+               and c.is_nullable = 'YES'
+               and (c.table_name, c.column_name) not in (
                    ('address','apartment_office'), ('courier','dismissal_date'),
                    ('restaurant','rating'), ('product','rating'), ('product','photo_url'),
                    ('review','photo_url'), ('order','courier_id'), ('order','delivery_timestamp')) loop
