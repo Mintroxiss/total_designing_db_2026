@@ -1,974 +1,485 @@
+-- Тесты логики триггеров актуальной схемы shkuratetskiy_food (PostgreSQL 15+).
+-- Запускать целиком в тестовой БД после установки DDL. Данные не очищаются.
+-- Проверяются 6 триггерных функций через реальные INSERT / UPDATE / DELETE.
+-- PK, FK, UNIQUE, CHECK, NOT NULL, индексы и generated columns отдельно не тестируются.
 begin;
+set local search_path to shkuratetskiy_food, exts, pg_temp;
 
-drop schema if exists tst cascade;
-create schema tst;
-set local search_path to shkuratetskiy_food, exts, tst;
-
-create table tst.result (
-    id      int generated always as identity primary key,
-    test    text    not null,
-    ok      boolean not null,
+create temp table result (
+    id int generated always as identity primary key,
+    test text not null,
+    ok boolean not null,
     details text
-);
+) on commit drop;
 
--- Инфраструктура
-create function tst.expect_error(p_test text, p_sql text, p_sqlstate text default null, p_msg text default null)
-returns void language plpgsql as $$
-declare
-    st  text;
-    msg text;
-begin
-    begin
-        execute p_sql;
-        execute 'set constraints all deferred';
-    exception when others then
-        get stacked diagnostics st = returned_sqlstate, msg = message_text;
-        if p_sqlstate is not null and st != p_sqlstate then
-            insert into tst.result(test, ok, details)
-            values (p_test, false, format('ожидался SQLSTATE %s, получен %s: %s', p_sqlstate, st, msg));
-        elsif p_msg is not null and position(p_msg in msg) = 0 then
-            insert into tst.result(test, ok, details)
-            values (p_test, false, format('сообщение «%s» не содержит «%s»', msg, p_msg));
-        else
-            insert into tst.result(test, ok) values (p_test, true);
-        end if;
-        return;
-    end;
-    insert into tst.result(test, ok, details) values (p_test, false, 'ожидалась ошибка, но запрос выполнился');
-end $$;
-
-create function tst.expect_ok(p_test text, p_sql text)
-returns void language plpgsql as $$
-begin
-    execute p_sql;
-    execute 'set constraints all deferred';
-    insert into tst.result(test, ok) values (p_test, true);
-exception when others then
-    insert into tst.result(test, ok, details) values (p_test, false, sqlstate || ': ' || sqlerrm);
-end $$;
-
-create function tst.expect_true(p_test text, p_query text)
+-- Один сценарий = одна запись. При неожиданном успехе или неверном результате
+-- откатываем операцию во вложенной транзакции, чтобы не портить следующие тесты.
+create function pg_temp.expect(p_test text, p_sql text, p_check text default null,
+                               p_state text default null, p_msg text default null)
 returns void language plpgsql as $$
 declare
     b boolean;
+    st text;
+    msg text;
 begin
-    execute p_query into b;
-    insert into tst.result(test, ok, details)
-    values (p_test, coalesce(b, false), case when b is true then null else 'условие ложно/NULL: ' || p_query end);
-exception when others then
-    insert into tst.result(test, ok, details) values (p_test, false, sqlstate || ': ' || sqlerrm);
+    begin
+        if p_sql is not null then execute p_sql; end if;
+        if p_state is not null then
+            raise exception using errcode = 'ZX001', message = 'ожидалась ошибка, но операция выполнена';
+        end if;
+        if p_check is not null then
+            execute p_check into b;
+            if b is distinct from true then
+                raise exception using errcode = 'ZX002', message = 'неверное состояние: ' || p_check;
+            end if;
+        end if;
+    exception when others then
+        get stacked diagnostics st = returned_sqlstate, msg = message_text;
+        if p_state is not null and st = p_state
+           and (p_msg is null or position(p_msg in msg) > 0) then
+            insert into pg_temp.result(test, ok) values (p_test, true);
+        else
+            insert into pg_temp.result(test, ok, details) values (p_test, false,
+                case when p_state is not null then 'ожидалось ' || p_state || ' / ' || coalesce(p_msg, '') || '; ' else '' end
+                || st || ': ' || msg);
+        end if;
+        return;
+    end;
+    insert into pg_temp.result(test, ok) values (p_test, true);
 end $$;
 
-create function tst.rnd(n int default 8) returns text language sql as $$
-    select substr(md5(random()::text || clock_timestamp()::text), 1, n)
-$$;
-
-create function tst.phone() returns text language sql as $$
-    select '+79' || lpad((floor(random() * 1e9))::bigint::text, 9, '0')
-$$;
-
--- обёртка для проверки отложенных триггеров (BR-9.1)
-create function tst.chk(p_sql text) returns text language sql as $$
-    select 'set constraints all deferred; ' || p_sql || '; set constraints all immediate'
-$$;
-
--- Фабрики данных
-create function tst.mk_address() returns uuid language plpgsql as $$
-declare id uuid;
+-- Минимальные фикстуры. UUID нужны только для изоляции от существующих данных.
+create function pg_temp.mk_address() returns uuid language plpgsql as $$
+declare v_id uuid := exts.uuid_generate_v4();
 begin
-    insert into address(street, house_number) values ('ул. ' || tst.rnd(12), tst.rnd(4))
-    returning address_id into id;
-    return id;
+    insert into address(address_id, street, house_number) values (v_id, 'Тест ' || v_id, '1');
+    return v_id;
 end $$;
 
-create function tst.mk_client() returns uuid language plpgsql as $$
-declare id uuid;
-begin
-    insert into client(login, password, phone_number)
-    values ('u' || tst.rnd(10), md5(random()::text), tst.phone())
-    returning client_id into id;
-    return id;
-end $$;
-
-create function tst.mk_client_address(p_client uuid default null) returns uuid language plpgsql as $$
+create function pg_temp.mk_ca() returns uuid language plpgsql as $$
 declare
-    c  uuid := coalesce(p_client, tst.mk_client());
-    id uuid;
+    v_client uuid := exts.uuid_generate_v4();
+    v_id uuid;
+    i bigint := 0;
 begin
-    insert into client_address(client_id, address_id) values (c, tst.mk_address())
-    returning client_address_id into id;
-    return id;
-end $$;
-
-create function tst.mk_restaurant() returns uuid language plpgsql as $$
-declare id uuid;
-begin
-    insert into restaurant(restaurant_name, address_id, description, work_start, work_end, company_details, status)
-    values ('Р ' || tst.rnd(), tst.mk_address(), 'описание', '09:00', '22:00', 'реквизиты', 'активен')
-    returning restaurant_id into id;
-    return id;
-end $$;
-
-create function tst.mk_product(p_rest uuid, p_price numeric default 1000,
-                               p_unit measure_unit default 'шт', p_status product_status default 'доступно')
-returns uuid language plpgsql as $$
-declare
-    cat uuid;
-    id  uuid;
-begin
-    insert into product_category(product_category_name) values ('к ' || tst.rnd()) returning product_category_id into cat;
-    insert into product(product_name, product_category_id, price, restaurant_id, status, description, measure_unit)
-    values ('п ' || tst.rnd(), cat, p_price, p_rest, p_status, 'описание', p_unit)
-    returning product_id into id;
-    return id;
-end $$;
-
-create function tst.mk_courier(p_status courier_status default 'свободен') returns uuid language plpgsql as $$
-declare id uuid;
-begin
-    insert into courier(full_name, phone_number, status, hire_date, dismissal_date)
-    values ('К ' || tst.rnd(), tst.phone(), p_status, current_date - 30,
-            case when p_status = 'уволен' then current_date end)
-    returning courier_id into id;
-    return id;
-end $$;
-
-create function tst.mk_order(p_ca uuid, p_rest uuid, p_courier uuid default null) returns uuid language plpgsql as $$
-declare id uuid;
-begin
-    insert into "order"(client_address_id, restaurant_id, courier_id, status)
-    values (p_ca, p_rest, p_courier, 'создан')
-    returning order_id into id;
-    return id;
-end $$;
-
--- Заказ с двумя позициями по 1000 руб (order_amount = 2000, total_amount = 2200)
-create function tst.mk_order_full(p_paid boolean default false, p_delivered boolean default false,
-                                  out o uuid, out r uuid, out p uuid, out p2 uuid, out ca uuid)
-language plpgsql as $$
-begin
-    r  := tst.mk_restaurant();
-    ca := tst.mk_client_address();
-    p  := tst.mk_product(r);
-    p2 := tst.mk_product(r);
-    o  := tst.mk_order(ca, r);
-    insert into order_structure(order_id, product_id, quantity) values (o, p, 1), (o, p2, 1);
-    if p_paid or p_delivered then
-        insert into payment(order_id, payment_type, transaction_id, status)
-        values (o, 'карта', tst.rnd(24), 'успех');
-    end if;
-    if p_delivered then
-        update "order" set status = 'доставлен', delivery_timestamp = localtimestamp where order_id = o;
-    end if;
-end $$;
-
--- SQL-строители
-create function tst.ins_item(p_order uuid, p_product uuid, p_qty text default '1', p_price text default 'null')
-returns text language sql as $$
-    select format('insert into order_structure(order_id, product_id, quantity, price) values (%L, %L, %s, %s)',
-                  p_order, p_product, p_qty, p_price)
-$$;
-
-create function tst.pay_sql(p_order uuid, p_status text, p_amount text default 'null') returns text language sql as $$
-    select format('insert into payment(order_id, payment_type, amount, transaction_id, status) values (%L, ''карта'', %s, %L, %L)',
-                  p_order, p_amount, tst.rnd(24), p_status)
-$$;
-
-create function tst.payout_sql(p_order uuid, p_status text, p_amount text default 'null') returns text language sql as $$
-    select format('insert into restaurant_payout(order_id, amount, transaction_id, status) values (%L, %s, %L, %L)',
-                  p_order, p_amount, tst.rnd(24), p_status)
-$$;
-
--- p_sub: 'product' | 'restaurant' | 'order' | 'none'
-create function tst.rv_sql(p_rid uuid, p_order uuid, p_sub text, p_target uuid default null) returns text language sql as $$
-    select format('insert into review(review_id, order_id, description, rating) values (%L, %L, ''текст'', 5); ', p_rid, p_order)
-        || case p_sub
-               when 'product'    then format('insert into product_review(review_id, product_id) values (%L, %L)', p_rid, p_target)
-               when 'restaurant' then format('insert into restaurant_review(review_id, restaurant_id) values (%L, %L)', p_rid, p_target)
-               when 'order'      then format('insert into order_review(review_id) values (%L)', p_rid)
-               else 'select 1'
-           end
-$$;
-
-create function tst.mk_review(p_order uuid, p_sub text, p_target uuid default null) returns uuid language plpgsql as $$
-declare rid uuid := uuid_generate_v4();
-begin
-    execute tst.rv_sql(rid, p_order, p_sub, p_target);
-    return rid;
-end $$;
-
-create function tst.amount_is(p_order uuid, p_expected text) returns text language sql as $$
-    select format('select order_amount is not distinct from %s from "order" where order_id = %L', p_expected, p_order)
-$$;
-
-create function tst.pay_status_is(p_order uuid, p_expected text) returns text language sql as $$
-    select format('select pay_status = %L from "order" where order_id = %L', p_expected, p_order)
-$$;
-
-
--- 1. order_amount_guard, order_pay_status_guard (BR-7.8–7.10, BR-8.7)
-do $t$
-declare
-    r uuid; ca uuid; o uuid := uuid_generate_v4(); o2 uuid := uuid_generate_v4();
-begin
-    r := tst.mk_restaurant(); ca := tst.mk_client_address();
-
-    perform tst.expect_ok('order_amount_guard: INSERT с order_amount принимается',
-        format($f$insert into "order"(order_id, client_address_id, restaurant_id, status, order_amount)
-                  values (%L, %L, %L, 'создан', 5000)$f$, o, ca, r));
-    perform tst.expect_true('order_amount_guard: INSERT обнуляет order_amount', tst.amount_is(o, 'null'));
-
-    perform tst.expect_error('order_amount_guard: ручной UPDATE order_amount запрещён',
-        format('update "order" set order_amount = 5000 where order_id = %L', o), 'P0001', 'вычисляется');
-
-    perform tst.expect_ok('order_pay_status_guard: INSERT с pay_status=оплачен принимается',
-        format($f$insert into "order"(order_id, client_address_id, restaurant_id, status, pay_status)
-                  values (%L, %L, %L, 'создан', 'оплачен')$f$, o2, ca, r));
-    perform tst.expect_true('order_pay_status_guard: INSERT сбрасывает pay_status в «ожидает»', tst.pay_status_is(o2, 'ожидает'));
-
-    perform tst.expect_error('order_pay_status_guard: ручной UPDATE pay_status запрещён',
-        format($f$update "order" set pay_status = 'оплачен' where order_id = %L$f$, o2), 'P0001', 'вычисляется');
-end $t$;
-
-
--- 2. item_before / item_after / check_quantity_measure / check_order_structure_restaurant
---    (BR-5.5, BR-7.3, BR-7.10, BR-7.11, BR-7.14–7.16)
-do $t$
-declare
-    r uuid; r_other uuid; ca uuid; o uuid; o2 uuid; o3 uuid;
-    p uuid; p_b uuid; p_kg uuid; p_other uuid; p_arch uuid; p_out uuid; p_cheap uuid;
-begin
-    r := tst.mk_restaurant(); r_other := tst.mk_restaurant(); ca := tst.mk_client_address();
-    o := tst.mk_order(ca, r); o2 := tst.mk_order(ca, r); o3 := tst.mk_order(ca, r);
-    p       := tst.mk_product(r);
-    p_b     := tst.mk_product(r);
-    p_kg    := tst.mk_product(r, 1000, 'кг');
-    p_other := tst.mk_product(r_other);
-    p_arch  := tst.mk_product(r, 1000, 'шт', 'архив');
-    p_out   := tst.mk_product(r, 1000, 'шт', 'нет_в_наличии');
-    p_cheap := tst.mk_product(r, 500);
-
-    -- check_order_structure_restaurant
-    perform tst.expect_error('order_structure: блюдо из чужого ресторана', tst.ins_item(o, p_other), '23514', 'не из ресторана');
-
-    -- item_before: INSERT
-    perform tst.expect_error('item_before: блюдо в архиве', tst.ins_item(o, p_arch), '23514', 'недоступно');
-    perform tst.expect_error('item_before: блюда нет в наличии', tst.ins_item(o, p_out), '23514', 'недоступно');
-    perform tst.expect_error('item_before: несуществующее блюдо', tst.ins_item(o, uuid_generate_v4()), '23503');
-    perform tst.expect_error('item_before: цена не совпадает с ценой блюда', tst.ins_item(o, p, '1', '5'), 'P0001', 'совпадать');
-    perform tst.expect_ok('item_before: цена совпадает с ценой блюда', tst.ins_item(o2, p, '1', '1000'));
-    perform tst.expect_ok('item_before: price=NULL подставляется из блюда', tst.ins_item(o, p));
-    perform tst.expect_true('item_before: price = цена блюда',
-        format('select price = 1000 from order_structure where order_id = %L and product_id = %L', o, p));
-
-    -- item_after: пересчёт суммы
-    perform tst.expect_true('item_after: order_amount = 1000 после первой позиции', tst.amount_is(o, '1000'));
-    perform tst.expect_true('order: commission = 10%, total_amount = 110%',
-        format('select commission = 100 and total_amount = 1100 from "order" where order_id = %L', o));
-
-    perform tst.expect_error('order_structure: дубль блюда в заказе (BR-7.16)', tst.ins_item(o, p), '23505');
-    perform tst.expect_error('order_structure: quantity = 0', tst.ins_item(o, p_b, '0'), '23514');
-
-    -- check_quantity_measure
-    perform tst.expect_error('check_quantity_measure: дробное количество для «шт»', tst.ins_item(o, p_b, '1.5'), '23514', 'штуках');
-    perform tst.expect_ok('check_quantity_measure: дробное количество для «кг»', tst.ins_item(o, p_kg, '0.5'));
-    perform tst.expect_true('item_after: сумма с дробным количеством = 1500', tst.amount_is(o, '1500'));
-
-    -- item_before: UPDATE
-    perform tst.expect_ok('item_before: UPDATE quantity разрешён',
-        format('update order_structure set quantity = 2.5 where order_id = %L and product_id = %L', o, p_kg));
-    perform tst.expect_true('item_after: сумма после UPDATE quantity = 3500', tst.amount_is(o, '3500'));
-    perform tst.expect_error('check_quantity_measure: UPDATE quantity на дробное для «шт»',
-        format('update order_structure set quantity = 1.5 where order_id = %L and product_id = %L', o, p), '23514');
-    perform tst.expect_error('item_before: UPDATE price запрещён',
-        format('update order_structure set price = 1 where order_id = %L and product_id = %L', o, p), 'P0001', 'фиксируется');
-    perform tst.expect_error('item_before: перенос позиции в другой заказ',
-        format('update order_structure set order_id = %L where order_id = %L and product_id = %L', o3, o, p), '23514', 'другой заказ');
-    perform tst.expect_error('item_before: смена блюда в позиции',
-        format('update order_structure set product_id = %L where order_id = %L and product_id = %L', p_b, o, p), '23514', 'менять блюдо');
-
-    -- item_before / item_after: DELETE
-    perform tst.expect_ok('item_before: DELETE позиции в заказе «создан»',
-        format('delete from order_structure where order_id = %L and product_id = %L', o, p_kg));
-    perform tst.expect_true('item_after: сумма после DELETE = 1000', tst.amount_is(o, '1000'));
-    perform tst.expect_ok('item_before: DELETE последней позиции',
-        format('delete from order_structure where order_id = %L and product_id = %L', o, p));
-    perform tst.expect_true('item_after: пустой заказ → order_amount NULL', tst.amount_is(o, 'null'));
-
-    -- порог 1000 руб (BR-7.11)
-    perform tst.expect_ok('item_after: заказ на 500 ₽', tst.ins_item(o3, p_cheap, '1'));
-    perform tst.expect_true('item_after: итог < 1000 ₽ → order_amount NULL', tst.amount_is(o3, 'null'));
-    perform tst.expect_ok('item_after: увеличиваем количество до 2', format('update order_structure set quantity = 2 where order_id = %L', o3));
-    perform tst.expect_true('item_after: итог 1100 ₽ → order_amount = 1000', tst.amount_is(o3, '1000'));
-end $t$;
-
--- item_before: блокировка состава
-do $t$
-declare
-    o uuid; r uuid; p uuid; p2 uuid; ca uuid; p_new uuid;
-begin
-    -- статус не "создан"
-    select * into o, r, p, p2, ca from tst.mk_order_full();
-    p_new := tst.mk_product(r);
-    update "order" set status = 'готовится' where order_id = o;
-    perform tst.expect_error('item_before: INSERT в заказ «готовится»', tst.ins_item(o, p_new), 'P0001', 'изменять нельзя');
-    perform tst.expect_error('item_before: DELETE из заказа «готовится»',
-        format('delete from order_structure where order_id = %L and product_id = %L', o, p), 'P0001', 'изменять нельзя');
-    perform tst.expect_error('item_before: UPDATE в заказе «готовится»',
-        format('update order_structure set quantity = 3 where order_id = %L and product_id = %L', o, p), 'P0001', 'изменять нельзя');
-
-    -- есть попытка оплаты
-    select * into o, r, p, p2, ca from tst.mk_order_full();
-    p_new := tst.mk_product(r);
-    execute tst.pay_sql(o, 'в_обработке');
-    perform tst.expect_error('item_before: INSERT при наличии платежа', tst.ins_item(o, p_new), 'P0001', 'изменять нельзя');
-    perform tst.expect_error('item_before: DELETE при наличии платежа',
-        format('delete from order_structure where order_id = %L and product_id = %L', o, p), 'P0001', 'изменять нельзя');
-
-    -- есть выплата ресторану
-    select * into o, r, p, p2, ca from tst.mk_order_full(true);
-    p_new := tst.mk_product(r);
-    execute tst.payout_sql(o, 'в_обработке');
-    perform tst.expect_error('item_before: INSERT при наличии выплаты', tst.ins_item(o, p_new), 'P0001', 'изменять нельзя');
-end $t$;
-
-
--- 3. payment_copy_amount, payment_closed_guard, prevent_success_transaction_change,
---    order_pay_status_sync, sync_order_pay_status (BR-8.1, 8.4, 8.7)
-do $t$
-declare
-    o uuid; r uuid; p uuid; p2 uuid; ca uuid; oe uuid; oc uuid; o_dst uuid;
-    tot text;
-begin
-    select * into o, r, p, p2, ca from tst.mk_order_full();
-    tot := format('(select total_amount from "order" where order_id = %L)', o);
-
-    -- payment_copy_amount: INSERT
-    perform tst.expect_ok('payment_copy_amount: amount = NULL допустим', tst.pay_sql(o, 'в_обработке'));
-    perform tst.expect_true('payment_copy_amount: amount скопирован из total_amount',
-        format('select pm.amount = od.total_amount and od.total_amount = 2200 from payment pm join "order" od using (order_id) where od.order_id = %L', o));
-    perform tst.expect_true('order_pay_status_sync: «в_обработке» → ожидает', tst.pay_status_is(o, 'ожидает'));
-    perform tst.expect_error('payment_copy_amount: сумма не равна сумме заказа', tst.pay_sql(o, 'в_обработке', '1'), 'P0001', 'не равна');
-    perform tst.expect_ok('payment_copy_amount: сумма равна сумме заказа', tst.pay_sql(o, 'ошибка', tot));
-    perform tst.expect_true('order_pay_status_sync: «в_обработке» + «ошибка» → ожидает', tst.pay_status_is(o, 'ожидает'));
-
-    oe := tst.mk_order(ca, r);
-    perform tst.expect_error('payment_copy_amount: заказ без суммы', tst.pay_sql(oe, 'в_обработке'), 'P0001', 'не определена');
-    perform tst.expect_error('payment_copy_amount: заказ не найден', tst.pay_sql(uuid_generate_v4(), 'в_обработке'), 'P0001', 'не найден');
-    perform tst.expect_error('payment_copy_amount: order_id = NULL', tst.pay_sql(null, 'в_обработке'), 'P0001', 'не найден');
-
-    select * into oc, r, p, p2, ca from tst.mk_order_full();
-    update "order" set status = 'отменён' where order_id = oc;
-    perform tst.expect_error('payment_copy_amount: заказ отменён', tst.pay_sql(oc, 'в_обработке'), 'P0001', 'отменён');
-
-    -- payment_copy_amount: UPDATE
-    perform tst.expect_error('payment_copy_amount: UPDATE amount запрещён',
-        format('update payment set amount = 1 where order_id = %L and status = ''ошибка''', o), 'P0001', 'менять сумму');
-    perform tst.expect_error('payment_copy_amount: UPDATE order_id запрещён',
-        format('update payment set order_id = %L where order_id = %L and status = ''ошибка''', oc, o), 'P0001', 'менять заказ');
-
-    -- order_pay_status_sync: UPDATE status
-    perform tst.expect_ok('order_pay_status_sync: «в_обработке» → «ошибка»',
-        format($f$update payment set status = 'ошибка' where order_id = %L and status = 'в_обработке'$f$, o));
-    perform tst.expect_true('order_pay_status_sync: все «ошибка» → ошибка', tst.pay_status_is(o, 'ошибка'));
-
-    perform tst.expect_ok('order_pay_status_sync: успешная попытка', tst.pay_sql(o, 'успех'));
-    perform tst.expect_true('order_pay_status_sync: есть «успех» → оплачен', tst.pay_status_is(o, 'оплачен'));
-
-    -- payment_closed_guard
-    perform tst.expect_error('payment_closed_guard: новая попытка у оплаченного заказа', tst.pay_sql(o, 'ошибка'), '23514', 'уже оплачен');
-    perform tst.expect_error('payment_closed_guard: вторая успешная попытка', tst.pay_sql(o, 'успех'), '23514', 'уже оплачен');
-
-    -- prevent_success_transaction_change
-    perform tst.expect_error('prevent_success_transaction_change: payment успех → ошибка',
-        format($f$update payment set status = 'ошибка' where order_id = %L and status = 'успех'$f$, o), 'P0001', 'успешной');
-    perform tst.expect_error('prevent_success_transaction_change: payment успех → в_обработке',
-        format($f$update payment set status = 'в_обработке' where order_id = %L and status = 'успех'$f$, o), 'P0001', 'успешной');
-
-    -- order_pay_status_sync: DELETE
-    perform tst.expect_ok('order_pay_status_sync: DELETE успешной попытки',
-        format($f$delete from payment where order_id = %L and status = 'успех'$f$, o));
-    perform tst.expect_true('order_pay_status_sync: после DELETE «успех» остались «ошибка» → ошибка', tst.pay_status_is(o, 'ошибка'));
-    perform tst.expect_ok('order_pay_status_sync: DELETE всех попыток', format('delete from payment where order_id = %L', o));
-    perform tst.expect_true('order_pay_status_sync: нет попыток → ожидает', tst.pay_status_is(o, 'ожидает'));
-
-    -- sync_order_pay_status напрямую
-    perform tst.expect_ok('sync_order_pay_status: несуществующий заказ — no-op', 'select sync_order_pay_status(uuid_generate_v4())');
-    perform tst.expect_ok('sync_order_pay_status: статус не меняется — no-op', format('select sync_order_pay_status(%L)', o));
-    perform tst.expect_true('sync_order_pay_status: статус остался «ожидает»', tst.pay_status_is(o, 'ожидает'));
-end $t$;
-
-
--- 4. payout_copy_amount (BR-1.5)
-do $t$
-declare
-    o uuid; r uuid; p uuid; p2 uuid; ca uuid; o_unpaid uuid; o_cancel uuid; o_other uuid;
-begin
-    select * into o, r, p, p2, ca from tst.mk_order_full(true);
-    select * into o_unpaid, r, p, p2, ca from tst.mk_order_full();
-    select * into o_cancel, r, p, p2, ca from tst.mk_order_full(true);
-    select * into o_other, r, p, p2, ca from tst.mk_order_full(true);
-    update "order" set status = 'отменён' where order_id = o_cancel;
-
-    perform tst.expect_ok('payout_copy_amount: amount = NULL допустим', tst.payout_sql(o, 'в_обработке'));
-    perform tst.expect_true('payout_copy_amount: amount = order_amount (без комиссии)',
-        format('select po.amount = od.order_amount and od.order_amount = 2000 from restaurant_payout po join "order" od using (order_id) where od.order_id = %L', o));
-    perform tst.expect_error('payout_copy_amount: сумма не равна стоимости блюд', tst.payout_sql(o, 'ошибка', '2200'), '23514', 'не равна');
-    perform tst.expect_ok('payout_copy_amount: сумма равна стоимости блюд', tst.payout_sql(o, 'ошибка', '2000'));
-    perform tst.expect_error('payout_copy_amount: заказ не оплачен', tst.payout_sql(o_unpaid, 'в_обработке'), '23514', 'не оплачен');
-    perform tst.expect_error('payout_copy_amount: заказ отменён', tst.payout_sql(o_cancel, 'в_обработке'), '23514', 'отменён');
-    perform tst.expect_error('payout_copy_amount: заказ не найден', tst.payout_sql(uuid_generate_v4(), 'в_обработке'), '23503');
-
-    perform tst.expect_error('payout_copy_amount: UPDATE amount запрещён',
-        format($f$update restaurant_payout set amount = 1 where order_id = %L and status = 'ошибка'$f$, o), 'P0001', 'менять сумму');
-    perform tst.expect_error('payout_copy_amount: перенос выплаты на другой заказ',
-        format($f$update restaurant_payout set order_id = %L where order_id = %L and status = 'ошибка'$f$, o_other, o), 'P0001', 'другой заказ');
-
-    -- prevent_success_transaction_change для выплат
-    perform tst.expect_ok('payout: успешная выплата', tst.payout_sql(o, 'успех'));
-    perform tst.expect_error('prevent_success_transaction_change: payout успех → ошибка',
-        format($f$update restaurant_payout set status = 'ошибка' where order_id = %L and status = 'успех'$f$, o), 'P0001', 'успешной');
-    perform tst.expect_ok('prevent_success_transaction_change: payout ошибка → в_обработке разрешён',
-        format($f$update restaurant_payout set status = 'в_обработке' where order_id = %L and status = 'ошибка'$f$, o));
-end $t$;
-
-
--- 5. Отзывы: review_lock_order, check_product_review, check_restaurant_review,
---    check_order_review, check_review_single_type, check_review_exactly_one_type,
---    review_order_immutable, order_client_guard, order_restaurant_guard (BR-9.x)
-do $t$
-declare
-    o uuid; r uuid; p uuid; p2 uuid; ca uuid; p3 uuid; r_other uuid; ca_other uuid;
-    o_nd uuid; o_b uuid; r_b uuid; p_b uuid; o_c uuid; r_c uuid; p_c uuid; p2_c uuid; ca_c uuid;
-    o_d uuid; p_d uuid; p2_d uuid; o_e uuid;
-    rid uuid; rid2 uuid;
-begin
-    -- review_lock_order
-    select * into o_nd, r, p, p2, ca from tst.mk_order_full(true); -- оплачен, но не доставлен
-    perform tst.expect_error('review_lock_order: заказ не доставлен',
-        tst.rv_sql(uuid_generate_v4(), o_nd, 'order'), '23514', 'доставленный');
-    perform tst.expect_error('review_lock_order: заказ не найден',
-        tst.rv_sql(uuid_generate_v4(), uuid_generate_v4(), 'order'), '23503', 'не найден');
-
-    -- check_product_review
-    select * into o, r, p, p2, ca from tst.mk_order_full(true, true);
-    r_other := tst.mk_restaurant();
-    p3 := tst.mk_product(r); -- не входит в заказ
-    ca_other := tst.mk_client_address();
-
-    perform tst.expect_ok('check_product_review: отзыв на блюдо из заказа',
-        tst.chk(tst.rv_sql(uuid_generate_v4(), o, 'product', p)));
-    perform tst.expect_error('check_product_review: второй отзыв на то же блюдо в заказе',
-        tst.chk(tst.rv_sql(uuid_generate_v4(), o, 'product', p)), '23505', 'уже есть отзыв');
-    perform tst.expect_ok('check_product_review: отзыв на другое блюдо в том же заказе',
-        tst.chk(tst.rv_sql(uuid_generate_v4(), o, 'product', p2)));
-    perform tst.expect_error('check_product_review: блюда нет в заказе',
-        tst.chk(tst.rv_sql(uuid_generate_v4(), o, 'product', p3)), '23514', 'нет в заказе');
-    perform tst.expect_error('check_product_review: отзыв не найден',
-        format('insert into product_review(review_id, product_id) values (%L, %L)', uuid_generate_v4(), p), '23503', 'не найден');
-
-    -- check_restaurant_review
-    perform tst.expect_ok('check_restaurant_review: отзыв на ресторан заказа',
-        tst.chk(tst.rv_sql(uuid_generate_v4(), o, 'restaurant', r)));
-    perform tst.expect_error('check_restaurant_review: второй отзыв на ресторан в заказе',
-        tst.chk(tst.rv_sql(uuid_generate_v4(), o, 'restaurant', r)), '23505', 'уже есть отзыв');
-    perform tst.expect_error('check_restaurant_review: заказ сделан не в этом ресторане',
-        tst.chk(tst.rv_sql(uuid_generate_v4(), o, 'restaurant', r_other)), '23514', 'сделан не в ресторане');
-    perform tst.expect_error('check_restaurant_review: отзыв не найден',
-        format('insert into restaurant_review(review_id, restaurant_id) values (%L, %L)', uuid_generate_v4(), r), '23503', 'не найден');
-
-    -- check_order_review
-    perform tst.expect_ok('check_order_review: отзыв на заказ', tst.chk(tst.rv_sql(uuid_generate_v4(), o, 'order')));
-    perform tst.expect_error('check_order_review: второй отзыв на заказ',
-        tst.chk(tst.rv_sql(uuid_generate_v4(), o, 'order')), '23505', 'уже есть отзыв');
-    perform tst.expect_error('check_order_review: отзыв не найден',
-        format('insert into order_review(review_id) values (%L)', uuid_generate_v4()), '23503', 'не найден');
-
-    -- order_client_guard / order_restaurant_guard / позиции у доставленного заказа (в заказе o уже есть отзывы)
-    perform tst.expect_error('order_client_guard: смена адреса у заказа с отзывом',
-        format('update "order" set client_address_id = %L where order_id = %L', ca_other, o), '23514', 'уже есть отзыв');
-    perform tst.expect_error('order_restaurant_guard: смена ресторана у заказа с позициями',
-        format('update "order" set restaurant_id = %L where order_id = %L', r_other, o), '23514', 'с позициями');
-    perform tst.expect_error('item_before: INSERT в доставленный заказ', tst.ins_item(o, p3), 'P0001', 'изменять нельзя');
-    perform tst.expect_error('item_before: DELETE из доставленного заказа',
-        format('delete from order_structure where order_id = %L and product_id = %L', o, p), 'P0001', 'изменять нельзя');
-
-    -- check_review_single_type
-    select * into o_b, r_b, p_b, p2, ca from tst.mk_order_full(true, true);
-    rid := uuid_generate_v4();
-    perform tst.expect_error('check_review_single_type: product_review + restaurant_review',
-        tst.chk(tst.rv_sql(rid, o_b, 'product', p_b) || format('; insert into restaurant_review(review_id, restaurant_id) values (%L, %L)', rid, r_b)),
-        '23514', 'уже привязан');
-    perform tst.expect_error('check_review_single_type: product_review + order_review',
-        tst.chk(tst.rv_sql(rid, o_b, 'product', p_b) || format('; insert into order_review(review_id) values (%L)', rid)),
-        '23514', 'уже привязан');
-    perform tst.expect_error('check_review_single_type: order_review + product_review',
-        tst.chk(tst.rv_sql(rid, o_b, 'order') || format('; insert into product_review(review_id, product_id) values (%L, %L)', rid, p_b)),
-        '23514', 'уже привязан');
-    perform tst.expect_error('check_review_single_type: restaurant_review + order_review',
-        tst.chk(tst.rv_sql(rid, o_b, 'restaurant', r_b) || format('; insert into order_review(review_id) values (%L)', rid)),
-        '23514', 'уже привязан');
-
-    -- check_review_exactly_one_type
-    perform tst.expect_error('exactly_one_type: отзыв без подтипа',
-        tst.chk(tst.rv_sql(uuid_generate_v4(), o_b, 'none')), '23514', 'ровно один');
-
-    select * into o_c, r_c, p_c, p2_c, ca_c from tst.mk_order_full(true, true);
-    rid := tst.mk_review(o_c, 'order');
-    perform tst.expect_error('exactly_one_type: удаление единственного подтипа',
-        tst.chk(format('delete from order_review where review_id = %L', rid)), '23514', 'ровно один');
-    perform tst.expect_ok('exactly_one_type: UPDATE review (rating)',
-        tst.chk(format('update review set rating = 3 where review_id = %L', rid)));
-    perform tst.expect_true('exactly_one_type: rating обновлён',
-        format('select rating = 3 from review where review_id = %L', rid));
-
-    rid2 := tst.mk_review(o_c, 'product', p_c);
-    perform tst.expect_ok('exactly_one_type: DELETE review каскадом удаляет подтип',
-        tst.chk(format('delete from review where review_id = %L', rid2)));
-    perform tst.expect_true('exactly_one_type: подтип удалён каскадом',
-        format('select not exists (select 1 from product_review where review_id = %L)', rid2));
-
-    select * into o_d, r, p_d, p2_d, ca from tst.mk_order_full(true, true);
-    rid := tst.mk_review(o_d, 'product', p_d);
-    perform tst.expect_ok('exactly_one_type: UPDATE product_review.product_id (ветка UPDATE)',
-        tst.chk(format('update product_review set product_id = %L where review_id = %L', p2_d, rid)));
-    perform tst.expect_true('product_review: product_id изменён',
-        format('select product_id = %L from product_review where review_id = %L', p2_d, rid));
-
-    -- review_order_immutable
-    select * into o_e, r, p, p2, ca from tst.mk_order_full(true, true);
-    perform tst.expect_error('review_order_immutable: смена заказа у отзыва',
-        format('update review set order_id = %L where review_id = %L', o_e, rid), '23514', 'Нельзя менять заказ');
-    perform tst.expect_error('review_order_immutable: обнуление заказа у отзыва вручную',
-        format('update review set order_id = null where review_id = %L', rid), '23514', 'Нельзя менять заказ');
-end $t$;
-
--- 5.1. UPDATE product_review.product_id: блюдо отсутствует в заказе
-do $t$
-declare
-    o uuid; r uuid; p uuid; p2 uuid; ca uuid;
-    p_other uuid;
-    rid uuid;
-begin
-    select * into o, r, p, p2, ca from tst.mk_order_full(true, true);
-
-    p_other := tst.mk_product(r);
-    rid := tst.mk_review(o, 'product', p);
-
-    perform tst.expect_error(
-        'check_product_review: UPDATE product_id на блюдо вне заказа',
-        format(
-            'update product_review set product_id = %L where review_id = %L',
-            p_other, rid
-        ),
-        '23514',
-        'нет в заказе'
-    );
-end $t$;
-
--- 5.2. UPDATE restaurant_review.restaurant_id
-do $t$
-declare
-    o uuid; r uuid; p uuid; p2 uuid; ca uuid;
-    r_other uuid;
-    rid uuid;
-begin
-    select * into o, r, p, p2, ca from tst.mk_order_full(true, true);
-
-    r_other := tst.mk_restaurant();
-    rid := tst.mk_review(o, 'restaurant', r);
-
-    perform tst.expect_error(
-        'check_restaurant_review: UPDATE restaurant_id на другой ресторан',
-        format(
-            'update restaurant_review set restaurant_id = %L where review_id = %L',
-            r_other, rid
-        ),
-        '23514',
-        'сделан не в ресторане'
-    );
-end $t$;
-
--- 5.3. check_review_single_type: UPDATE review_id во всех подтипах
-do $t$
-declare
-    o1 uuid; r1 uuid; p1 uuid; p12 uuid; ca1 uuid;
-    o2 uuid; r2 uuid; p2 uuid; p22 uuid; ca2 uuid;
-    o3 uuid; r3 uuid; p3 uuid; p32 uuid; ca3 uuid;
-    o4 uuid; r4 uuid; p4 uuid; p42 uuid; ca4 uuid;
-    o5 uuid; r5 uuid; p5 uuid; p52 uuid; ca5 uuid;
-    o6 uuid; r6 uuid; p6 uuid; p62 uuid; ca6 uuid;
-
-    rid_product_source uuid;
-    rid_restaurant_target uuid;
-
-    rid_restaurant_source uuid;
-    rid_order_target uuid;
-
-    rid_order_source uuid;
-    rid_product_target uuid;
-begin
-    -- product_review -> review с уже существующим restaurant_review
-    select * into o1, r1, p1, p12, ca1 from tst.mk_order_full(true, true);
-    select * into o2, r2, p2, p22, ca2 from tst.mk_order_full(true, true);
-
-    rid_product_source := tst.mk_review(o1, 'product', p1);
-    rid_restaurant_target := tst.mk_review(o2, 'restaurant', r2);
-
-    perform tst.expect_error(
-        'check_review_single_type: UPDATE product_review.review_id на restaurant_review',
-        format(
-            'update product_review set review_id = %L, product_id = %L where review_id = %L',
-            rid_restaurant_target, p2, rid_product_source
-        ),
-        '23514',
-        'уже привязан'
-    );
-
-    -- restaurant_review -> review с уже существующим order_review
-    select * into o3, r3, p3, p32, ca3 from tst.mk_order_full(true, true);
-    select * into o4, r4, p4, p42, ca4 from tst.mk_order_full(true, true);
-
-    rid_restaurant_source := tst.mk_review(o3, 'restaurant', r3);
-    rid_order_target := tst.mk_review(o4, 'order');
-
-    perform tst.expect_error(
-        'check_review_single_type: UPDATE restaurant_review.review_id на order_review',
-        format(
-            'update restaurant_review set review_id = %L, restaurant_id = %L where review_id = %L',
-            rid_order_target, r4, rid_restaurant_source
-        ),
-        '23514',
-        'уже привязан'
-    );
-
-    -- order_review -> review с уже существующим product_review
-    select * into o5, r5, p5, p52, ca5 from tst.mk_order_full(true, true);
-    select * into o6, r6, p6, p62, ca6 from tst.mk_order_full(true, true);
-
-    rid_order_source := tst.mk_review(o5, 'order');
-    rid_product_target := tst.mk_review(o6, 'product', p6);
-
-    perform tst.expect_error(
-        'check_review_single_type: UPDATE order_review.review_id на product_review',
-        format(
-            'update order_review set review_id = %L where review_id = %L',
-            rid_product_target, rid_order_source
-        ),
-        '23514',
-        'уже привязан'
-    );
-end $t$;
-
--- 5.4. check_review_exactly_one_type: явное принудительное выполнение constraint trigger
-do $t$
-declare
-    o uuid; r uuid; p uuid; p2 uuid; ca uuid;
-    rid uuid := uuid_generate_v4();
-begin
-    select * into o, r, p, p2, ca from tst.mk_order_full(true, true);
-
-    perform tst.expect_error(
-        'check_review_exactly_one_type: ошибка при SET CONSTRAINTS IMMEDIATE',
-        format(
-            $q$
-                set constraints all deferred;
-
-                insert into review(review_id, order_id, description, rating)
-                values (%L, %L, 'текст', 5);
-
-                set constraints
-                    trg_review_exactly_one_type,
-                    trg_product_review_exactly_one_type,
-                    trg_restaurant_review_exactly_one_type,
-                    trg_order_review_exactly_one_type
-                immediate;
-            $q$,
-            rid, o
-        ),
-        '23514',
-        'ровно один подтип'
-    );
-end $t$;
-
-
-
--- 6. Адреса: check_client_address_not_restaurant, check_restaurant_address_not_client,
---    uq_address_physical (BR-2.5, BR-3.3, BR-3.4)
-do $t$
-declare
-    r uuid; ra uuid; c uuid; c2 uuid; ca uuid; ad uuid; s text := 'Ул ' || tst.rnd(10);
-    ins_rest text := $f$insert into restaurant(restaurant_name, address_id, description, work_start, work_end, company_details, status)
-                        values ('x', %L, 'd', '09:00', '21:00', 'c', 'активен')$f$;
-begin
-    r := tst.mk_restaurant();
-    select address_id into ra from restaurant where restaurant_id = r;
-    c := tst.mk_client(); c2 := tst.mk_client();
-    ca := tst.mk_client_address(c);
-    select address_id into ad from client_address where client_address_id = ca;
-
-    perform tst.expect_error('check_client_address_not_restaurant: INSERT адреса ресторана клиенту',
-        format('insert into client_address(client_id, address_id) values (%L, %L)', c, ra), '23514', 'занят рестораном');
-    perform tst.expect_error('check_client_address_not_restaurant: UPDATE address_id на адрес ресторана',
-        format('update client_address set address_id = %L where client_address_id = %L', ra, ca), '23514', 'занят рестораном');
-    perform tst.expect_ok('client_address: один адрес у двух клиентов',
-        format('insert into client_address(client_id, address_id) values (%L, %L)', c2, ad));
-    perform tst.expect_error('client_address: один адрес дважды у одного клиента (BR-2.5)',
-        format('insert into client_address(client_id, address_id) values (%L, %L)', c, ad), '23505');
-
-    perform tst.expect_error('check_restaurant_address_not_client: INSERT ресторана на адрес клиента',
-        format(ins_rest, ad), '23514', 'используется клиентом');
-    perform tst.expect_error('check_restaurant_address_not_client: UPDATE адреса ресторана на адрес клиента',
-        format('update restaurant set address_id = %L where restaurant_id = %L', ad, r), '23514', 'используется клиентом');
-    perform tst.expect_ok('restaurant: ресторан на свободный адрес', format(ins_rest, tst.mk_address()));
-    perform tst.expect_error('restaurant: два ресторана на одном адресе (BR-3.3)', format(ins_rest, ra), '23505');
-
-    -- uq_address_physical
-    perform tst.expect_ok('uq_address_physical: адрес без квартиры',
-        format('insert into address(street, house_number) values (%L, ''1'')', s));
-    perform tst.expect_error('uq_address_physical: дубль без учёта регистра и пробелов',
-        format('insert into address(street, house_number) values (%L, '' 1 '')', '  ' || upper(s) || ' '), '23505');
-    perform tst.expect_ok('uq_address_physical: тот же дом с квартирой',
-        format('insert into address(street, house_number, apartment_office) values (%L, ''1'', ''5'')', s));
-    perform tst.expect_error('uq_address_physical: дубль квартиры',
-        format('insert into address(street, house_number, apartment_office) values (%L, ''1'', '' 5 '')', lower(s)), '23505');
-    perform tst.expect_error('address: пустая квартира запрещена',
-        format('insert into address(street, house_number, apartment_office) values (%L, ''2'', ''  '')', s), '23514');
-end $t$;
-
-
--- 7. product_restaurant_guard, product_measure_guard (BR-7.3, BR-7.15)
-do $t$
-declare
-    o uuid; r uuid; p uuid; p2 uuid; ca uuid; p_free uuid; r2 uuid;
-begin
-    select * into o, r, p, p2, ca from tst.mk_order_full();
-    p_free := tst.mk_product(r);
-    r2 := tst.mk_restaurant();
-
-    perform tst.expect_error('product_restaurant_guard: смена ресторана у блюда из заказа',
-        format('update product set restaurant_id = %L where product_id = %L', r2, p), '23514', 'есть в заказах');
-    perform tst.expect_ok('product_restaurant_guard: смена ресторана у блюда вне заказов',
-        format('update product set restaurant_id = %L where product_id = %L', r2, p_free));
-    perform tst.expect_error('product_measure_guard: смена единицы у блюда из заказа',
-        format($f$update product set measure_unit = 'кг' where product_id = %L$f$, p), '23514', 'есть в заказах');
-    perform tst.expect_ok('product_measure_guard: смена единицы у блюда вне заказов',
-        format($f$update product set measure_unit = 'кг' where product_id = %L$f$, p_free));
-    perform tst.expect_ok('product_measure_guard: та же единица у блюда из заказа (триггер не срабатывает)',
-        format($f$update product set measure_unit = 'шт' where product_id = %L$f$, p));
-end $t$;
-
-
--- 8. Курьеры: check_order_courier, check_courier_dismissal (BR-7.5)
-do $t$
-declare
-    r uuid; ca uuid; c_free uuid; c_fired uuid;
-    o uuid;
-begin
-    r := tst.mk_restaurant(); ca := tst.mk_client_address();
-    c_free := tst.mk_courier(); c_fired := tst.mk_courier('уволен');
-
-    -- check_order_courier
-    perform tst.expect_error('check_order_courier: INSERT заказа с уволенным курьером',
-        format($f$insert into "order"(client_address_id, restaurant_id, courier_id, status) values (%L, %L, %L, 'создан')$f$, ca, r, c_fired),
-        '23514', 'уволенного');
-    perform tst.expect_ok('check_order_courier: INSERT заказа с работающим курьером',
-        format($f$insert into "order"(client_address_id, restaurant_id, courier_id, status) values (%L, %L, %L, 'создан')$f$, ca, r, c_free));
-    perform tst.expect_ok('check_order_courier: INSERT заказа без курьера',
-        format($f$insert into "order"(client_address_id, restaurant_id, status) values (%L, %L, 'создан')$f$, ca, r));
-    o := tst.mk_order(ca, r);
-    perform tst.expect_error('check_order_courier: UPDATE на уволенного курьера',
-        format('update "order" set courier_id = %L where order_id = %L', c_fired, o), '23514', 'уволенного');
-    perform tst.expect_ok('check_order_courier: UPDATE на работающего курьера',
-        format('update "order" set courier_id = %L where order_id = %L', c_free, o));
-    perform tst.expect_ok('check_order_courier: UPDATE courier_id = NULL',
-        format('update "order" set courier_id = null where order_id = %L', o));
-
-end $t$;
-
--- продолжение группы курьеров
-do $t$
-declare
-    r uuid; ca uuid; c_done uuid; c_cancel uuid; c_none uuid; o_done uuid; o_cancel uuid;
-    r2 uuid; p uuid; p2 uuid; ca2 uuid; c_deliv uuid;
-begin
-    r := tst.mk_restaurant(); ca := tst.mk_client_address();
-    c_none := tst.mk_courier(); c_cancel := tst.mk_courier(); c_deliv := tst.mk_courier();
-
-    select * into o_done, r2, p, p2, ca2 from tst.mk_order_full(true, true);
-    update "order" set courier_id = c_deliv where order_id = o_done;
-    o_cancel := tst.mk_order(ca, r, c_cancel);
-    update "order" set status = 'отменён' where order_id = o_cancel;
-
-    perform tst.expect_ok('check_courier_dismissal: курьер без заказов',
-        format($f$update courier set status = 'уволен', dismissal_date = current_date where courier_id = %L$f$, c_none));
-    perform tst.expect_ok('check_courier_dismissal: у курьера только отменённый заказ',
-        format($f$update courier set status = 'уволен', dismissal_date = current_date where courier_id = %L$f$, c_cancel));
-    perform tst.expect_ok('check_courier_dismissal: у курьера только доставленный заказ',
-        format($f$update courier set status = 'уволен', dismissal_date = current_date where courier_id = %L$f$, c_deliv));
-end $t$;
-
--- активный заказ в каждом из статусов "создан", "готовится", "в_доставке" блокирует увольнение
-do $t$
-declare
-    o uuid; r uuid; p uuid; p2 uuid; ca uuid; c uuid; st text;
-begin
-    foreach st in array array['создан', 'готовится', 'в_доставке'] loop
-        select * into o, r, p, p2, ca from tst.mk_order_full();
-        c := tst.mk_courier();
-        update "order" set courier_id = c, status = st::order_status where order_id = o;
-        perform tst.expect_error('check_courier_dismissal: заказ в статусе «' || st || '»',
-            format($f$update courier set status = 'уволен', dismissal_date = current_date where courier_id = %L$f$, c),
-            'P0001', 'активные заказы');
+    loop
+        insert into client(client_id, login, password, phone_number)
+        values (v_client, 't_' || replace(v_client::text, '-', ''), md5('test'),
+                '+79' || lpad(i::text, 9, '0'))
+        on conflict (phone_number) do nothing;
+        exit when found;
+        i := i + 1;
+        if i > 999999999 then raise exception 'Нет свободного тестового номера'; end if;
     end loop;
-end $t$;
+    insert into client_address(client_id, address_id) values (v_client, pg_temp.mk_address())
+    returning client_address_id into v_id;
+    return v_id;
+end $$;
 
+create function pg_temp.mk_rest() returns uuid language plpgsql as $$
+declare v_id uuid;
+begin
+    insert into restaurant(restaurant_name, address_id, description, work_start, work_end,
+                           inn, ogrn, bank_account, status)
+    values ('Тест', pg_temp.mk_address(), 'Тест', '09:00', '22:00', '1234567890',
+            '1234567890123', '40702000000000000000', 'активен')
+    returning restaurant_id into v_id;
+    return v_id;
+end $$;
 
--- 9. order_parties_guard (BR-7.2, BR-7.4, BR-11.3)
+create function pg_temp.mk_product(p_rest uuid, p_unit measure_unit default 'шт', p_price numeric default 1000)
+returns uuid language plpgsql as $$
+declare v_cat uuid; v_id uuid;
+begin
+    insert into product_category(product_category_name) values ('Тест') returning product_category_id into v_cat;
+    insert into product(product_name, product_category_id, price, restaurant_id, status, description, measure_unit)
+    values ('Тест', v_cat, p_price, p_rest, 'доступно', 'Тест', p_unit) returning product_id into v_id;
+    return v_id;
+end $$;
+
+create function pg_temp.mk_order(p_ca uuid, p_rest uuid) returns uuid language plpgsql as $$
+declare v_id uuid;
+begin
+    insert into "order"(client_address_id, restaurant_id, status) values (p_ca, p_rest, 'создан')
+    returning order_id into v_id;
+    return v_id;
+end $$;
+
+create function pg_temp.item_sql(p_o uuid, p_p uuid, p_qty numeric default 1, p_price numeric default 1000)
+returns text language sql as $$
+    select format('insert into order_structure(order_id, product_id, quantity, price) values (%L,%L,%L,%L)', p_o,p_p,p_qty,p_price)
+$$;
+
+create function pg_temp.amount_is(p_o uuid, p_amount numeric) returns text language sql as $$
+    select format('select order_amount = %L from "order" where order_id = %L', p_amount,p_o)
+$$;
+
+create function pg_temp.status_is(p_o uuid, p_status text) returns text language sql as $$
+    select format('select pay_status = %L from "order" where order_id = %L', p_status,p_o)
+$$;
+
+create function pg_temp.pay_sql(p_id uuid, p_o uuid, p_amount numeric, p_status text)
+returns text language sql as $$
+    select format('insert into payment(payment_id, order_id, payment_type, amount, transaction_id, status) values (%L,%L,''карта'',%L,%L,%L)',
+                  p_id,p_o,p_amount,p_id::text,p_status)
+$$;
+
+create function pg_temp.review_sql(p_id uuid, p_o uuid, p_type text, p_entity uuid)
+returns text language sql as $$
+    select format('insert into review(review_id, order_id, entity_type, entity_id, description, rating) values (%L,%L,%L,%L,''Тест'',5)',
+                  p_id,p_o,p_type,p_entity)
+$$;
+
+-- 1. check_order_product_restaurant: все три направления проверки
 do $t$
 declare
-    r uuid; r2 uuid; c uuid; ca uuid; ca2 uuid; c_del uuid; ca_del uuid; o uuid;
-    ins text := $f$insert into "order"(client_address_id, restaurant_id, status) values (%L, %L, 'создан')$f$;
+    r uuid; r2 uuid; ca uuid; o uuid; o2 uuid; empty_o uuid; p uuid; p2 uuid; free_p uuid;
 begin
-    r := tst.mk_restaurant(); r2 := tst.mk_restaurant();
-    c := tst.mk_client(); ca := tst.mk_client_address(c); ca2 := tst.mk_client_address();
-    c_del := tst.mk_client(); ca_del := tst.mk_client_address(c_del);
-    delete from client where client_id = c_del;   -- client_address.client_id → NULL (BR-3.5)
-    o := tst.mk_order(ca, r);
-
-    perform tst.expect_ok('order_parties_guard: INSERT с адресом клиента и рестораном', format(ins, ca, r));
-    perform tst.expect_error('order_parties_guard: INSERT без адреса', format(ins, null, r), '23502', 'адрес клиента');
-    perform tst.expect_error('order_parties_guard: INSERT без ресторана', format(ins, ca, null), '23502', 'ресторан');
-    perform tst.expect_error('order_parties_guard: INSERT на адрес без клиента', format(ins, ca_del, r), '23514', 'не привязан');
-    perform tst.expect_error('order_parties_guard: INSERT на несуществующий client_address', format(ins, uuid_generate_v4(), r), '23514', 'не привязан');
-
-    perform tst.expect_error('order_parties_guard: UPDATE адреса на NULL',
-        format('update "order" set client_address_id = null where order_id = %L', o), '23502', 'адрес клиента');
-    perform tst.expect_error('order_parties_guard: UPDATE ресторана на NULL',
-        format('update "order" set restaurant_id = null where order_id = %L', o), '23502', 'ресторан');
-    perform tst.expect_error('order_parties_guard: UPDATE адреса на адрес без клиента',
-        format('update "order" set client_address_id = %L where order_id = %L', ca_del, o), '23514', 'не привязан');
-    perform tst.expect_ok('order_parties_guard: UPDATE адреса на другой адрес клиента (заказ без отзывов)',
-        format('update "order" set client_address_id = %L where order_id = %L', ca2, o));
-    perform tst.expect_ok('order_restaurant_guard: смена ресторана у пустого заказа без отзывов',
-        format('update "order" set restaurant_id = %L where order_id = %L', r2, o));
-    perform tst.expect_error('order_parties_guard: UPDATE ресторана на NULL (порядок триггеров)',
-        format('update "order" set restaurant_id = null where order_id = %L', o), '23502');
+    r := pg_temp.mk_rest(); r2 := pg_temp.mk_rest(); ca := pg_temp.mk_ca();
+    o := pg_temp.mk_order(ca,r); o2 := pg_temp.mk_order(ca,r2); empty_o := pg_temp.mk_order(ca,r);
+    p := pg_temp.mk_product(r); p2 := pg_temp.mk_product(r2); free_p := pg_temp.mk_product(r);
+    perform pg_temp.expect('Ресторан: INSERT чужого блюда',
+        pg_temp.item_sql(o, p2), p_state => '23514', p_msg => 'не принадлежит ресторану заказа');
+    perform pg_temp.expect('Ресторан: INSERT своего блюда',
+        pg_temp.item_sql(o, p),
+        format($q$select exists(select 1 from order_structure where order_id = %L and product_id = %L)$q$, o, p));
+    perform pg_temp.expect('Ресторан: UPDATE product_id на чужое блюдо',
+        format($q$update order_structure set product_id = %L where order_id = %L and product_id = %L$q$, p2, o, p), p_state => '23514', p_msg => 'не принадлежит ресторану заказа');
+    perform pg_temp.expect('Ресторан: UPDATE order_id на заказ другого ресторана',
+        format($q$update order_structure set order_id = %L where order_id = %L and product_id = %L$q$, o2, o, p), p_state => '23514', p_msg => 'не принадлежит ресторану заказа');
+    perform pg_temp.expect('Ресторан: смена ресторана блюда с заказами',
+        format($q$update product set restaurant_id = %L where product_id = %L$q$, r2, p), p_state => '23514', p_msg => 'нарушается состав заказов');
+    perform pg_temp.expect('Ресторан: смена ресторана непустого заказа',
+        format($q$update "order" set restaurant_id = %L where order_id = %L$q$, r2, o), p_state => '23514', p_msg => 'в заказе есть блюда другого ресторана');
+    perform pg_temp.expect('Ресторан: смена ресторана свободного блюда',
+        format($q$update product set restaurant_id = %L where product_id = %L$q$, r2, free_p),
+        format($q$select restaurant_id = %L from product where product_id = %L$q$, r2, free_p));
+    perform pg_temp.expect('Ресторан: смена ресторана пустого заказа',
+        format($q$update "order" set restaurant_id = %L where order_id = %L$q$, r2, empty_o),
+        format($q$select restaurant_id = %L from "order" where order_id = %L$q$, r2, empty_o));
+    perform pg_temp.expect('Ресторан: одновременная замена заказа и блюда на согласованную пару',
+        format($q$update order_structure set order_id = %L, product_id = %L where order_id = %L and product_id = %L$q$, o2, p2, o, p),
+        format($q$select (select order_amount = %L from "order" where order_id = %L) and (select order_amount = %L from "order" where order_id = %L)$q$, 0, o, 1000, o2));
+exception when others then
+    insert into pg_temp.result(test, ok, details) values ('Ресторан: ошибка подготовки/сценария', false, sqlstate || ': ' || sqlerrm);
 end $t$;
 
-
--- 10. Сохранение истории: ON DELETE SET NULL при depth > 1 (BR-3.5)
---     order_client_guard, order_restaurant_guard, review_order_immutable,
---     payment_copy_amount, payout_copy_amount, order_parties_guard, order_pay_status_sync
+-- 2. update_order_amount: INSERT / UPDATE / DELETE, обе стороны переноса
 do $t$
 declare
-    o uuid; r uuid; p uuid; p2 uuid; ca uuid; rid uuid; pid uuid; po uuid;
-    r_empty uuid; o_empty uuid; ca_e uuid;
+    r uuid; ca uuid; o uuid; o2 uuid; p uuid; p2 uuid; p3 uuid;
 begin
-    -- удаление client_address у доставленного заказа с отзывом: order_client_guard (ранний выход)
-    select * into o, r, p, p2, ca from tst.mk_order_full(true, true);
-    rid := tst.mk_review(o, 'order');
-    perform tst.expect_ok('order_client_guard: удаление client_address обнуляет order.client_address_id',
-        format('delete from client_address where client_address_id = %L', ca));
-    perform tst.expect_true('order.client_address_id стал NULL, заказ и отзыв сохранены',
-        format('select client_address_id is null and exists (select 1 from review where review_id = %L) from "order" where order_id = %L', rid, o));
-
-    -- удаление ресторана без блюд: order_restaurant_guard (ранний выход) и order_parties_guard при depth > 1
-    r_empty := tst.mk_restaurant(); ca_e := tst.mk_client_address();
-    o_empty := tst.mk_order(ca_e, r_empty);
-    perform tst.expect_ok('order_restaurant_guard: удаление ресторана обнуляет order.restaurant_id',
-        format('delete from restaurant where restaurant_id = %L', r_empty));
-    perform tst.expect_true('order.restaurant_id стал NULL',
-        format('select restaurant_id is null from "order" where order_id = %L', o_empty));
-
-    -- удаление клиента: client_address.client_id → NULL, адрес сохранён
-    perform tst.expect_ok('client: удаление клиента', format('delete from client where client_id = (select client_id from client_address where client_address_id = %L)', ca_e));
-    perform tst.expect_true('client_address и address сохранены после удаления клиента',
-        format('select client_id is null and exists (select 1 from address where address_id = ca.address_id) from client_address ca where client_address_id = %L', ca_e));
-
-    -- удаление заказа (при временно отключённых trg_item_*): review/payment/payout.order_id → NULL
-    select * into o, r, p, p2, ca from tst.mk_order_full(true, true);
-    rid := tst.mk_review(o, 'order');
-    select payment_id into pid from payment where order_id = o;
-    insert into restaurant_payout(order_id, transaction_id, status) values (o, tst.rnd(24), 'успех') returning payout_id into po;
-
-    perform tst.expect_ok('review_order_immutable / payment / payout: удаление заказа обнуляет order_id',
-        $f$alter table order_structure disable trigger trg_item_before;
-           alter table order_structure disable trigger trg_item_after;
-        $f$ || format('delete from order_structure where order_id = %L; delete from "order" where order_id = %L; ', o, o) ||
-        $f$alter table order_structure enable trigger trg_item_before;
-           alter table order_structure enable trigger trg_item_after$f$);
-    perform tst.expect_true('review.order_id = NULL после удаления заказа',  format('select order_id is null from review where review_id = %L', rid));
-    perform tst.expect_true('payment.order_id = NULL после удаления заказа', format('select order_id is null from payment where payment_id = %L', pid));
-    perform tst.expect_true('restaurant_payout.order_id = NULL после удаления заказа', format('select order_id is null from restaurant_payout where payout_id = %L', po));
-    perform tst.expect_true('триггеры trg_item_* снова включены',
-        $q$select count(*) = 2 from pg_trigger where tgrelid = 'shkuratetskiy_food.order_structure'::regclass
-                               and tgname in ('trg_item_before', 'trg_item_after') and tgenabled = 'O'$q$);
+    r := pg_temp.mk_rest(); ca := pg_temp.mk_ca(); o := pg_temp.mk_order(ca,r); o2 := pg_temp.mk_order(ca,r);
+    p := pg_temp.mk_product(r); p2 := pg_temp.mk_product(r,'кг', 250); p3 := pg_temp.mk_product(r,'л', 100);
+    perform pg_temp.expect('Сумма: первая позиция ниже порога 1000',
+        pg_temp.item_sql(o, p, 1, 500),
+        pg_temp.amount_is(o, 500));
+    perform pg_temp.expect('Сумма: несколько позиций одним INSERT',
+        format($q$insert into order_structure(order_id,product_id,quantity,price) values (%L,%L,1.5,250), (%L,%L,0.75,100)$q$, o, p2, o, p3),
+        pg_temp.amount_is(o, 950));
+    perform pg_temp.expect('Сумма: UPDATE quantity',
+        format($q$update order_structure set quantity = 2 where order_id = %L and product_id = %L$q$, o, p),
+        pg_temp.amount_is(o, 1450));
+    perform pg_temp.expect('Сумма: UPDATE price',
+        format($q$update order_structure set price = 600 where order_id = %L and product_id = %L$q$, o, p),
+        pg_temp.amount_is(o, 1650));
+    perform pg_temp.expect('Сумма: дробное произведение округляется до копеек',
+        format($q$update order_structure set quantity = 1.333, price = 100.01 where order_id = %L and product_id = %L$q$, o, p3),
+        pg_temp.amount_is(o, 1708.31));
+    perform pg_temp.expect('Сумма: второй заказ имеет собственную позицию',
+        pg_temp.item_sql(o2, p, 1, 700),
+        pg_temp.amount_is(o2, 700));
+    perform pg_temp.expect('Сумма: перенос позиции пересчитывает оба непустых заказа',
+        format($q$update order_structure set order_id = %L where order_id = %L and product_id = %L$q$, o2, o, p2),
+        format($q$select (select order_amount = %L from "order" where order_id = %L) and (select order_amount = %L from "order" where order_id = %L)$q$, 1333.31, o, 1075, o2));
+    perform pg_temp.expect('Сумма: DELETE одной позиции',
+        format($q$delete from order_structure where order_id = %L and product_id = %L$q$, o2, p2),
+        pg_temp.amount_is(o2, 700));
+    perform pg_temp.expect('Сумма: DELETE последней позиции даёт 0, не NULL',
+        format($q$delete from order_structure where order_id = %L and product_id = %L$q$, o2, p),
+        pg_temp.amount_is(o2, 0));
+    perform pg_temp.expect('Сумма: DELETE нескольких позиций одним запросом',
+        format($q$delete from order_structure where order_id = %L$q$, o),
+        format($q$select (select order_amount = %L from "order" where order_id = %L) and (select order_amount = %L from "order" where order_id = %L)$q$, 0, o, 0, o2));
+    perform pg_temp.expect('Сумма: округляется общая сумма, а не каждое произведение отдельно',
+        format($q$insert into order_structure(order_id,product_id,quantity,price) values (%L,%L,0.005,1), (%L,%L,0.005,1)$q$, o, p2, o, p3),
+        pg_temp.amount_is(o, 0.01));
+exception when others then
+    insert into pg_temp.result(test, ok, details) values ('Сумма: ошибка подготовки/сценария', false, sqlstate || ': ' || sqlerrm);
 end $t$;
 
-
--- 11. Дополнительные ветки: UPDATE review_id у подтипов, заказ-призрак, повторное увольнение
+-- 3. check_product_quantity: количество и смена единицы измерения
 do $t$
 declare
-    o uuid; r uuid; p uuid; p2 uuid; ca uuid;
-    o2 uuid; r2 uuid; pb uuid; pb2 uuid; ca2 uuid;
-    rp uuid; rr uuid; ro uuid; rc uuid; c_fired uuid;
+    r uuid; ca uuid; o uuid; o2 uuid; piece uuid; kg uuid; litre uuid; free_p uuid;
 begin
-    select * into o,  r,  p,  p2,  ca  from tst.mk_order_full(true, true);
-    select * into o2, r2, pb, pb2, ca2 from tst.mk_order_full(true, true);
-    rp := tst.mk_review(o, 'product', p);
-    rr := tst.mk_review(o, 'restaurant', r);
-    ro := tst.mk_review(o, 'order');
-
-    -- тот же заказ: старая строка подтипа считается «другим отзывом» → дубль
-    rc := uuid_generate_v4();
-    perform tst.expect_error('check_product_review: UPDATE review_id на отзыв того же заказа',
-        tst.chk(tst.rv_sql(rc, o, 'none') || format('; update product_review set review_id = %L where review_id = %L', rc, rp)),
-        '23505', 'уже есть отзыв');
-    rc := uuid_generate_v4();
-    perform tst.expect_error('check_restaurant_review: UPDATE review_id на отзыв того же заказа',
-        tst.chk(tst.rv_sql(rc, o, 'none') || format('; update restaurant_review set review_id = %L where review_id = %L', rc, rr)),
-        '23505', 'уже есть отзыв');
-    rc := uuid_generate_v4();
-    perform tst.expect_error('check_order_review: UPDATE review_id на отзыв того же заказа',
-        tst.chk(tst.rv_sql(rc, o, 'none') || format('; update order_review set review_id = %L where review_id = %L', rc, ro)),
-        '23505', 'уже есть отзыв');
-
-    -- перенос на отзыв другого заказа
-    rc := uuid_generate_v4();
-    perform tst.expect_error('check_product_review: UPDATE review_id на отзыв заказа без этого блюда',
-        tst.chk(tst.rv_sql(rc, o2, 'none') || format('; update product_review set review_id = %L where review_id = %L', rc, rp)),
-        '23514', 'нет в заказе');
-    rc := uuid_generate_v4();
-    perform tst.expect_error('check_restaurant_review: UPDATE review_id на отзыв заказа другого ресторана',
-        tst.chk(tst.rv_sql(rc, o2, 'none') || format('; update restaurant_review set review_id = %L where review_id = %L', rc, rr)),
-        '23514', 'сделан не в ресторане');
-    rc := uuid_generate_v4();
-    perform tst.expect_error('exactly_one_type: UPDATE review_id оставляет старый отзыв без подтипа (ветка ids=[old,new])',
-        tst.chk(tst.rv_sql(rc, o2, 'none') || format('; update order_review set review_id = %L where review_id = %L', rc, ro)),
-        '23514', 'ровно один');
-    rc := uuid_generate_v4();
-    perform tst.expect_ok('exactly_one_type: перенос order_review + новый подтип у старого отзыва',
-        tst.chk(tst.rv_sql(rc, o2, 'none')
-            || format('; update order_review set review_id = %L where review_id = %L', rc, ro)
-            || format('; insert into product_review(review_id, product_id) values (%L, %L)', ro, p2)));
-    perform tst.expect_true('после переноса: order_review у нового отзыва, product_review у старого',
-        format('select exists (select 1 from order_review where review_id = %L) and exists (select 1 from product_review where review_id = %L)', rc, ro));
-
-    -- item_before: заказ не существует (st IS NULL) → отсекает check_order_structure_restaurant
-    perform tst.expect_error('item_before: INSERT в несуществующий заказ', tst.ins_item(uuid_generate_v4(), p), '23514', 'не из ресторана');
-
-    -- check_courier_dismissal: повторное увольнение и восстановление
-    c_fired := tst.mk_courier('уволен');
-    perform tst.expect_ok('check_courier_dismissal: повторный UPDATE status=уволен (no-op)',
-        format($f$update courier set status = 'уволен' where courier_id = %L$f$, c_fired));
-    perform tst.expect_ok('check_courier_dismissal: восстановление курьера',
-        format($f$update courier set status = 'свободен', dismissal_date = null where courier_id = %L$f$, c_fired));
+    r := pg_temp.mk_rest(); ca := pg_temp.mk_ca(); o := pg_temp.mk_order(ca,r); o2 := pg_temp.mk_order(ca,r);
+    piece := pg_temp.mk_product(r); kg := pg_temp.mk_product(r,'кг'); litre := pg_temp.mk_product(r,'л'); free_p := pg_temp.mk_product(r,'кг');
+    perform pg_temp.expect('Количество: дробное шт при INSERT',
+        pg_temp.item_sql(o, piece, 1.5), p_state => '23514', p_msg => 'Количество штучного блюда должно быть целым');
+    perform pg_temp.expect('Количество: целое шт',
+        pg_temp.item_sql(o, piece, 2),
+        pg_temp.amount_is(o, 2000));
+    perform pg_temp.expect('Количество: дробное кг',
+        pg_temp.item_sql(o, kg, 0.5),
+        pg_temp.amount_is(o, 2500));
+    perform pg_temp.expect('Количество: дробное л',
+        pg_temp.item_sql(o, litre, 0.75),
+        pg_temp.amount_is(o, 3250));
+    perform pg_temp.expect('Количество: дробное шт при UPDATE quantity',
+        format($q$update order_structure set quantity = 1.5 where order_id = %L and product_id = %L$q$, o, piece), p_state => '23514', p_msg => 'Количество штучного блюда должно быть целым');
+    perform pg_temp.expect('Количество: целое шт при UPDATE',
+        format($q$update order_structure set quantity = 3 where order_id = %L and product_id = %L$q$, o, piece),
+        pg_temp.amount_is(o, 4250));
+    perform pg_temp.expect('Количество: дробная позиция в другом заказе',
+        pg_temp.item_sql(o2, kg, 0.25),
+        pg_temp.amount_is(o2, 250));
+    perform pg_temp.expect('Количество: UPDATE product_id с кг на шт при дробном количестве',
+        format($q$update order_structure set product_id = %L where order_id = %L and product_id = %L$q$, piece, o2, kg), p_state => '23514', p_msg => 'Количество штучного блюда должно быть целым');
+    perform pg_temp.expect('Количество: смена кг на шт при дробных позициях',
+        format($q$update product set measure_unit = 'шт' where product_id = %L$q$, kg), p_state => '23514', p_msg => 'существуют дробные позиции заказа');
+    perform pg_temp.expect('Количество: смена л на шт при дробной позиции',
+        format($q$update product set measure_unit = 'шт' where product_id = %L$q$, litre), p_state => '23514', p_msg => 'существуют дробные позиции заказа');
+    perform pg_temp.expect('Количество: смена кг на л с дробными позициями',
+        format($q$update product set measure_unit = 'л' where product_id = %L$q$, kg),
+        format($q$select measure_unit = 'л' from product where product_id = %L$q$, kg));
+    perform pg_temp.expect('Количество: исправление только одной дробной позиции',
+        format($q$update order_structure set quantity = 1 where order_id = %L and product_id = %L$q$, o, kg),
+        pg_temp.amount_is(o, 4750));
+    perform pg_temp.expect('Количество: оставшаяся дробная позиция в другом заказе блокирует шт',
+        format($q$update product set measure_unit = 'шт' where product_id = %L$q$, kg), p_state => '23514', p_msg => 'существуют дробные позиции заказа');
+    perform pg_temp.expect('Количество: исправление последней дробной позиции',
+        format($q$update order_structure set quantity = 2 where order_id = %L and product_id = %L$q$, o2, kg),
+        pg_temp.amount_is(o2, 2000));
+    perform pg_temp.expect('Количество: переход на шт при целых позициях во всех заказах',
+        format($q$update product set measure_unit = 'шт' where product_id = %L$q$, kg),
+        format($q$select measure_unit = 'шт' from product where product_id = %L$q$, kg));
+    perform pg_temp.expect('Количество: переход на шт у блюда без заказов',
+        format($q$update product set measure_unit = 'шт' where product_id = %L$q$, free_p),
+        format($q$select measure_unit = 'шт' from product where product_id = %L$q$, free_p));
+exception when others then
+    insert into pg_temp.result(test, ok, details) values ('Количество: ошибка подготовки/сценария', false, sqlstate || ': ' || sqlerrm);
 end $t$;
 
+-- 4. check_payment_amount: сумма оплаты, исторические попытки, блокировка оплаченного заказа
+do $t$
+declare
+    r uuid; ca uuid; o uuid; o2 uuid; p uuid; p2 uuid; failed uuid := exts.uuid_generate_v4(); pending uuid := exts.uuid_generate_v4();
+    spare uuid := exts.uuid_generate_v4();
+begin
+    r := pg_temp.mk_rest(); ca := pg_temp.mk_ca(); o := pg_temp.mk_order(ca,r); o2 := pg_temp.mk_order(ca,r);
+    p := pg_temp.mk_product(r); p2 := pg_temp.mk_product(r);
+    execute pg_temp.item_sql(o,p,2); execute pg_temp.item_sql(o2,p,3);
+    perform pg_temp.expect('Оплата: INSERT неверной суммы (выше допустимого минимума)',
+        pg_temp.pay_sql(spare, o, 2100, 'в_обработке'), p_state => '23514', p_msg => 'не соответствует общей сумме заказа');
+    perform pg_temp.expect('Оплата: INSERT корректной неуспешной попытки',
+        pg_temp.pay_sql(failed, o, 2200, 'ошибка'),
+        pg_temp.status_is(o, 'ошибка'));
+    perform pg_temp.expect('Оплата: INSERT корректной ожидающей попытки',
+        pg_temp.pay_sql(pending, o, 2200, 'в_обработке'),
+        pg_temp.status_is(o, 'ожидает'));
+    perform pg_temp.expect('Оплата: изменение заказа при неуспешных попытках разрешено',
+        format($q$update order_structure set quantity = 3 where order_id = %L and product_id = %L$q$, o, p),
+        pg_temp.amount_is(o, 3000));
+    perform pg_temp.expect('Оплата: устаревшая сумма попытки сохраняется; смена статуса не на успех разрешена',
+        format($q$update payment set status = 'ошибка' where payment_id = %L$q$, pending),
+        format($q$select amount = 2200 and status = 'ошибка' from payment where payment_id = %L$q$, pending));
+    perform pg_temp.expect('Оплата: устаревшая неуспешная попытка снова может ожидать',
+        format($q$update payment set status = 'в_обработке' where payment_id = %L$q$, pending),
+        pg_temp.status_is(o, 'ожидает'));
+    perform pg_temp.expect('Оплата: устаревшая попытка не может стать успешной',
+        format($q$update payment set status = 'успех' where payment_id = %L$q$, pending), p_state => '23514', p_msg => 'не соответствует общей сумме заказа');
+    perform pg_temp.expect('Оплата: UPDATE amount на неверную сумму при статусе ошибка',
+        format($q$update payment set amount = 3200 where payment_id = %L$q$, failed), p_state => '23514', p_msg => 'не соответствует общей сумме заказа');
+    perform pg_temp.expect('Оплата: перенос устаревшей попытки к заказу с другой суммой',
+        format($q$update payment set order_id = %L where payment_id = %L$q$, o2, failed), p_state => '23514', p_msg => 'не соответствует общей сумме заказа');
+    perform pg_temp.expect('Оплата: UPDATE amount на текущую сумму разрешён',
+        format($q$update payment set amount = 3300 where payment_id = %L$q$, failed),
+        format($q$select amount = 3300 from payment where payment_id = %L$q$, failed));
+    perform pg_temp.expect('Оплата: перенос корректной попытки к заказу с равной суммой',
+        format($q$update payment set order_id = %L where payment_id = %L$q$, o2, failed),
+        format($q$select (select pay_status = %L from "order" where order_id = %L) and (select pay_status = %L from "order" where order_id = %L)$q$, 'ожидает', o, 'ошибка', o2));
+    perform pg_temp.expect('Оплата: одновременная коррекция суммы и переход в успех',
+        format($q$update payment set amount = 3300, status = 'успех' where payment_id = %L$q$, pending),
+        pg_temp.status_is(o, 'оплачен'));
+    perform pg_temp.expect('Оплата: успешная попытка не допускает INSERT новой позиции с изменением суммы',
+        pg_temp.item_sql(o, p2, 1), p_state => '23514', p_msg => 'существует успешная попытка оплаты');
+    perform pg_temp.expect('Оплата: успешная попытка не допускает UPDATE quantity с изменением суммы',
+        format($q$update order_structure set quantity = 4 where order_id = %L and product_id = %L$q$, o, p), p_state => '23514', p_msg => 'существует успешная попытка оплаты');
+    perform pg_temp.expect('Оплата: успешная попытка не допускает UPDATE price с изменением суммы',
+        format($q$update order_structure set price = 1100 where order_id = %L and product_id = %L$q$, o, p), p_state => '23514', p_msg => 'существует успешная попытка оплаты');
+    perform pg_temp.expect('Оплата: успешная попытка не допускает DELETE позиции с изменением суммы',
+        format($q$delete from order_structure where order_id = %L and product_id = %L$q$, o, p), p_state => '23514', p_msg => 'существует успешная попытка оплаты');
+    perform pg_temp.expect('Оплата: перенос позиции из оплаченного заказа с изменением суммы запрещён',
+        format($q$update order_structure set order_id = %L, product_id = %L where order_id = %L and product_id = %L$q$, o2, p2, o, p), p_state => '23514', p_msg => 'существует успешная попытка оплаты');
+    perform pg_temp.expect('Оплата: перенос позиции в оплаченный заказ с изменением суммы запрещён',
+        format($q$update order_structure set order_id = %L, product_id = %L where order_id = %L and product_id = %L$q$, o, p2, o2, p), p_state => '23514', p_msg => 'существует успешная попытка оплаты');
+    perform pg_temp.expect('Оплата: прямой UPDATE суммы оплаченного заказа также запрещён',
+        format($q$update "order" set order_amount = 4000 where order_id = %L$q$, o), p_state => '23514', p_msg => 'существует успешная попытка оплаты');
+    perform pg_temp.expect('Оплата: успешная попытка не допускает собственный UPDATE amount на неверную сумму',
+        format($q$update payment set amount = 3400 where payment_id = %L$q$, pending), p_state => '23514', p_msg => 'не соответствует общей сумме заказа');
+    perform pg_temp.expect('Оплата: отклонённые операции не изменили оплаченный заказ',
+        null,
+        format($q$select order_amount = 3000 and pay_status = 'оплачен' and (select count(*) from order_structure where order_id = %L) = 1 from "order" where order_id = %L$q$, o, o));
+    perform pg_temp.expect('Оплата: UPDATE позиции без изменения итоговой суммы разрешён',
+        format($q$update order_structure set quantity = 2, price = 1500 where order_id = %L and product_id = %L$q$, o, p),
+        format($q$select (select order_amount = 3000 from "order" where order_id = %L) and (select quantity = 2 and price = 1500 from order_structure where order_id = %L and product_id = %L)$q$, o, o, p));
+    perform pg_temp.expect('Оплата: после удаления успешной попытки сумму снова можно менять',
+        format($q$delete from payment where payment_id = %L; update order_structure set quantity = 4 where order_id = %L and product_id = %L$q$, pending, o, p),
+        format($q$select order_amount = 6000 and pay_status = 'ожидает' from "order" where order_id = %L$q$, o));
+exception when others then
+    insert into pg_temp.result(test, ok, details) values ('Сумма оплаты: ошибка подготовки/сценария', false, sqlstate || ': ' || sqlerrm);
+end $t$;
 
--- Итог
-select count(*) filter (where ok) as passed, count(*) filter (where not ok) as failed, count(*) as total from tst.result;
-select id, test, details from tst.result where not ok order by id;
+-- 5. update_order_pay_status: приоритеты, смена статуса, перенос, удаление
+do $t$
+declare
+    r uuid; ca uuid; o uuid; o2 uuid; p uuid; a uuid := exts.uuid_generate_v4(); b uuid := exts.uuid_generate_v4(); c uuid := exts.uuid_generate_v4();
+begin
+    r := pg_temp.mk_rest(); ca := pg_temp.mk_ca(); o := pg_temp.mk_order(ca,r); o2 := pg_temp.mk_order(ca,r);
+    p := pg_temp.mk_product(r); execute pg_temp.item_sql(o,p); execute pg_temp.item_sql(o2,p);
+    perform pg_temp.expect('Статус: единственная ошибка → ошибка',
+        pg_temp.pay_sql(a, o, 1100, 'ошибка'),
+        pg_temp.status_is(o, 'ошибка'));
+    perform pg_temp.expect('Статус: ошибка + в_обработке → ожидает',
+        pg_temp.pay_sql(b, o, 1100, 'в_обработке'),
+        pg_temp.status_is(o, 'ожидает'));
+    perform pg_temp.expect('Статус: ошибка + в_обработке + успех → оплачен',
+        pg_temp.pay_sql(c, o, 1100, 'успех'),
+        pg_temp.status_is(o, 'оплачен'));
+    perform pg_temp.expect('Статус: UPDATE успех → ошибка при ожидающей попытке',
+        format($q$update payment set status = 'ошибка' where payment_id = %L$q$, c),
+        pg_temp.status_is(o, 'ожидает'));
+    perform pg_temp.expect('Статус: UPDATE последней ожидающей попытки → ошибка',
+        format($q$update payment set status = 'ошибка' where payment_id = %L$q$, b),
+        pg_temp.status_is(o, 'ошибка'));
+    perform pg_temp.expect('Статус: UPDATE ошибка → в_обработке',
+        format($q$update payment set status = 'в_обработке' where payment_id = %L$q$, b),
+        pg_temp.status_is(o, 'ожидает'));
+    perform pg_temp.expect('Статус: UPDATE в_обработке → успех',
+        format($q$update payment set status = 'успех' where payment_id = %L$q$, b),
+        pg_temp.status_is(o, 'оплачен'));
+    perform pg_temp.expect('Статус: перенос успешной попытки пересчитывает оба заказа',
+        format($q$update payment set order_id = %L where payment_id = %L$q$, o2, b),
+        format($q$select (select pay_status = %L from "order" where order_id = %L) and (select pay_status = %L from "order" where order_id = %L)$q$, 'ошибка', o, 'оплачен', o2));
+    perform pg_temp.expect('Статус: перенос обратно одновременно со сменой на в_обработке',
+        format($q$update payment set order_id = %L, status = 'в_обработке' where payment_id = %L$q$, o, b),
+        format($q$select (select pay_status = %L from "order" where order_id = %L) and (select pay_status = %L from "order" where order_id = %L)$q$, 'ожидает', o, 'ожидает', o2));
+    perform pg_temp.expect('Статус: новая успешная попытка через UPDATE',
+        format($q$update payment set status = 'успех' where payment_id = %L$q$, c),
+        pg_temp.status_is(o, 'оплачен'));
+    perform pg_temp.expect('Статус: DELETE успеха → ожидает при оставшейся в_обработке',
+        format($q$delete from payment where payment_id = %L$q$, c),
+        pg_temp.status_is(o, 'ожидает'));
+    perform pg_temp.expect('Статус: DELETE в_обработке → ошибка при оставшейся ошибке',
+        format($q$delete from payment where payment_id = %L$q$, b),
+        pg_temp.status_is(o, 'ошибка'));
+    perform pg_temp.expect('Статус: DELETE последней ошибки → ожидает',
+        format($q$delete from payment where payment_id = %L$q$, a),
+        pg_temp.status_is(o, 'ожидает'));
+exception when others then
+    insert into pg_temp.result(test, ok, details) values ('Статус оплаты: ошибка подготовки/сценария', false, sqlstate || ': ' || sqlerrm);
+end $t$;
 
+-- 6. check_review_entity: три типа отзывов, INSERT и UPDATE
+-- Статус «создан» выбран специально: актуальный триггер проверяет принадлежность
+-- объекта заказу, а не факт доставки; успешная оплата не должна маскировать проверки.
+do $t$
+declare
+    r uuid; r2 uuid; ca uuid; o uuid; o2 uuid; p uuid; p2 uuid; p3 uuid;
+    rp uuid := exts.uuid_generate_v4(); rr uuid := exts.uuid_generate_v4(); ro uuid := exts.uuid_generate_v4(); x uuid := exts.uuid_generate_v4();
+begin
+    r := pg_temp.mk_rest(); r2 := pg_temp.mk_rest(); ca := pg_temp.mk_ca(); o := pg_temp.mk_order(ca,r); o2 := pg_temp.mk_order(ca,r2);
+    p := pg_temp.mk_product(r); p2 := pg_temp.mk_product(r); p3 := pg_temp.mk_product(r);
+    execute pg_temp.item_sql(o,p); execute pg_temp.item_sql(o,p2);
+    perform pg_temp.expect('Отзыв: блюдо того же ресторана, но вне заказа',
+        pg_temp.review_sql(x, o, 'блюдо', p3), p_state => '23514', p_msg => 'отсутствует в заказе');
+    perform pg_temp.expect('Отзыв: ресторан не соответствует заказу',
+        pg_temp.review_sql(x, o, 'ресторан', r2), p_state => '23514', p_msg => 'не соответствует ресторану заказа');
+    perform pg_temp.expect('Отзыв: идентификатор другого заказа',
+        pg_temp.review_sql(x, o, 'заказ', o2), p_state => '23514', p_msg => 'Идентификатор объекта отзыва не соответствует заказу');
+    perform pg_temp.expect('Отзыв: заказанное блюдо',
+        pg_temp.review_sql(rp, o, 'блюдо', p),
+        format($q$select exists(select 1 from review where review_id = %L)$q$, rp));
+    perform pg_temp.expect('Отзыв: ресторан заказа',
+        pg_temp.review_sql(rr, o, 'ресторан', r),
+        format($q$select exists(select 1 from review where review_id = %L)$q$, rr));
+    perform pg_temp.expect('Отзыв: сам заказ',
+        pg_temp.review_sql(ro, o, 'заказ', o),
+        format($q$select exists(select 1 from review where review_id = %L)$q$, ro));
+    perform pg_temp.expect('Отзыв: UPDATE entity_id блюда на отсутствующее',
+        format($q$update review set entity_id = %L where review_id = %L$q$, p3, rp), p_state => '23514', p_msg => 'отсутствует в заказе');
+    perform pg_temp.expect('Отзыв: UPDATE entity_id ресторана на чужой',
+        format($q$update review set entity_id = %L where review_id = %L$q$, r2, rr), p_state => '23514', p_msg => 'не соответствует ресторану заказа');
+    perform pg_temp.expect('Отзыв: UPDATE entity_id заказа на другой',
+        format($q$update review set entity_id = %L where review_id = %L$q$, o2, ro), p_state => '23514', p_msg => 'Идентификатор объекта отзыва не соответствует заказу');
+    perform pg_temp.expect('Отзыв: UPDATE order_id без согласования объекта',
+        format($q$update review set order_id = %L where review_id = %L$q$, o2, rp), p_state => '23514', p_msg => 'отсутствует в заказе');
+    perform pg_temp.expect('Отзыв: UPDATE entity_type без согласования объекта',
+        format($q$update review set entity_type = 'ресторан' where review_id = %L$q$, rp), p_state => '23514', p_msg => 'не соответствует ресторану заказа');
+    perform pg_temp.expect('Отзыв: UPDATE entity_id на другое блюдо заказа',
+        format($q$update review set entity_id = %L where review_id = %L$q$, p2, rp),
+        format($q$select entity_id = %L from review where review_id = %L$q$, p2, rp));
+    perform pg_temp.expect('Отзыв: согласованный UPDATE order_id и entity_id',
+        format($q$update review set order_id = %L, entity_id = %L where review_id = %L$q$, o2, o2, ro),
+        format($q$select order_id = %L and entity_id = %L from review where review_id = %L$q$, o2, o2, ro));
+    perform pg_temp.expect('Отзыв: согласованный UPDATE entity_type и entity_id',
+        format($q$update review set entity_type = 'заказ', entity_id = %L where review_id = %L$q$, o, rp),
+        format($q$select entity_type = 'заказ' and entity_id = %L from review where review_id = %L$q$, o, rp));
+exception when others then
+    insert into pg_temp.result(test, ok, details) values ('Объект отзыва: ошибка подготовки/сценария', false, sqlstate || ': ' || sqlerrm);
+end $t$;
+
+-- 7. check_review_entity: защита связанных объектов при обратных изменениях
+do $t$
+declare
+    r uuid; r2 uuid; ca uuid; o uuid; o2 uuid; o3 uuid; p uuid; p2 uuid; p3 uuid;
+    rp uuid := exts.uuid_generate_v4(); rr uuid := exts.uuid_generate_v4();
+begin
+    r := pg_temp.mk_rest(); r2 := pg_temp.mk_rest(); ca := pg_temp.mk_ca();
+    o := pg_temp.mk_order(ca,r); o2 := pg_temp.mk_order(ca,r); o3 := pg_temp.mk_order(ca,r);
+    p := pg_temp.mk_product(r); p2 := pg_temp.mk_product(r); p3 := pg_temp.mk_product(r);
+    execute pg_temp.item_sql(o,p); execute pg_temp.item_sql(o,p2);
+    execute pg_temp.review_sql(rp,o,'блюдо',p);
+    -- Пустой заказ с отзывом на ресторан изолирует этот триггер от проверки состава.
+    execute pg_temp.review_sql(rr,o3,'ресторан',r);
+    perform pg_temp.expect('Отзыв: DELETE позиции с отзывом',
+        format($q$delete from order_structure where order_id = %L and product_id = %L$q$, o, p), p_state => '23514', p_msg => 'существует отзыв');
+    perform pg_temp.expect('Отзыв: UPDATE product_id позиции с отзывом',
+        format($q$update order_structure set product_id = %L where order_id = %L and product_id = %L$q$, p3, o, p), p_state => '23514', p_msg => 'существует отзыв');
+    perform pg_temp.expect('Отзыв: UPDATE order_id позиции с отзывом',
+        format($q$update order_structure set order_id = %L where order_id = %L and product_id = %L$q$, o2, o, p), p_state => '23514', p_msg => 'существует отзыв');
+    perform pg_temp.expect('Отзыв: UPDATE quantity позиции с отзывом не меняет объект отзыва',
+        format($q$update order_structure set quantity = 2 where order_id = %L and product_id = %L$q$, o, p),
+        pg_temp.amount_is(o, 3000));
+    perform pg_temp.expect('Отзыв: UPDATE неизменных ключей позиции разрешён',
+        format($q$update order_structure set order_id = order_id, product_id = product_id where order_id = %L and product_id = %L$q$, o, p),
+        pg_temp.amount_is(o, 3000));
+    perform pg_temp.expect('Отзыв: замена блюда без отзыва разрешена',
+        format($q$update order_structure set product_id = %L where order_id = %L and product_id = %L$q$, p3, o, p2),
+        format($q$select exists(select 1 from order_structure where order_id = %L and product_id = %L)$q$, o, p3));
+    perform pg_temp.expect('Отзыв: DELETE блюда без отзыва разрешён',
+        format($q$delete from order_structure where order_id = %L and product_id = %L$q$, o, p3),
+        pg_temp.amount_is(o, 2000));
+    perform pg_temp.expect('Отзыв: смена ресторана пустого заказа с отзывом на ресторан',
+        format($q$update "order" set restaurant_id = %L where order_id = %L$q$, r2, o3), p_state => '23514', p_msg => 'существует отзыв на ресторан');
+    perform pg_temp.expect('Отзыв: после удаления отзыва на блюдо его можно перенести',
+        format($q$delete from review where review_id = %L; update order_structure set order_id = %L where order_id = %L and product_id = %L$q$, rp, o2, o, p),
+        format($q$select (select order_amount = %L from "order" where order_id = %L) and (select order_amount = %L from "order" where order_id = %L)$q$, 0, o, 2000, o2));
+    perform pg_temp.expect('Отзыв: после удаления отзыва на ресторан смена ресторана разрешена',
+        format($q$delete from review where review_id = %L; update "order" set restaurant_id = %L where order_id = %L$q$, rr, r2, o3),
+        format($q$select restaurant_id = %L from "order" where order_id = %L$q$, r2, o3));
+    perform pg_temp.expect('Отзыв: отзыв на заказ сам по себе не блокирует смену ресторана',
+        pg_temp.review_sql(rr,o3,'заказ',o3) || format($q$; update "order" set restaurant_id = %L where order_id = %L$q$, r, o3),
+        format($q$select restaurant_id = %L from "order" where order_id = %L$q$, r, o3));
+exception when others then
+    insert into pg_temp.result(test, ok, details) values ('Защита объекта отзыва: ошибка подготовки/сценария', false, sqlstate || ': ' || sqlerrm);
+end $t$;
+
+-- Итог: одна строка со счётчиками и отдельный вывод только ошибок.
+select count(*) filter (where ok) as passed,
+       count(*) filter (where not ok) as failed,
+       count(*) as total
+from pg_temp.result;
+select id, test, details from pg_temp.result where not ok order by id;
 rollback;
