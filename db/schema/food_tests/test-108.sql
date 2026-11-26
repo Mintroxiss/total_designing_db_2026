@@ -1,4 +1,4 @@
--- Актуальная схема shkuratetskiy_food. Запускать весь скрипт в тестовой БД.
+-- Требует запуска в тестовой базе
 begin;
 
 drop schema if exists tst cascade;
@@ -14,11 +14,9 @@ create table tst.result (
 
 create sequence tst.seq;
 
--- общие объекты сценария: адрес клиента, ресторан, блюдо и курьер
 create table tst.ctx (ca uuid, rest uuid, prod uuid, courier uuid);
 
 
--- Инфраструктура
 create function tst.expect_true(p_test text, p_query text)
 returns void language plpgsql as $$
 declare
@@ -47,7 +45,6 @@ begin
 end $$;
 
 
--- Построители данных
 create function tst.mk_rest(p_name text) returns uuid language plpgsql as $$
 declare
     a uuid;
@@ -107,7 +104,6 @@ begin
 end $$;
 
 
--- чистая база + общие объекты сценария
 create function tst.setup() returns void language plpgsql as $$
 declare
     r uuid;
@@ -135,8 +131,6 @@ begin
 end $$;
 
 
--- Создаём заказ с назначенным курьером и одной позицией.
--- Цена позиции фиксирует стоимость заказа; суммы вычисляют триггеры.
 create function tst.mk_order(p_status order_status, p_ts timestamp,
                              p_amount numeric, p_created timestamp default null)
 returns void language plpgsql as $$
@@ -196,7 +190,7 @@ begin
 end $$;
 
 
--- 1. Серия месяцев
+-- Проверяет диапазон месяцев
 do $t$
 begin
     perform tst.setup();
@@ -204,19 +198,17 @@ begin
     perform tst.expect_true('серия: нет доставленных заказов — представление пустое',
         'select count(*) = 0 from how_much_money');
 
-    -- недоставленный заказ диапазон не создаёт
     perform tst.mk_other('создан', '2026-03-10');
 
     perform tst.expect_true('серия: только недоставленные заказы — представление пустое',
         'select count(*) = 0 from how_much_money');
 
-    -- один месяц
     perform tst.mk_deliv('2026-03-15 12:00');
 
     perform tst.expect_true('серия: один месяц — ровно одна строка',
         $q$select count(*) = 1 and bool_and(year_month = '2026-03') from how_much_money$q$);
 
-    -- 2025-11 .. 2026-02: переход через границу года, месяцы 12 и 01 без заказов
+    -- Проверяет переход между годами с двумя месяцами без доставок
     perform tst.setup();
     perform tst.mk_deliv('2025-11-15 12:00');
     perform tst.mk_deliv('2026-02-10 12:00');
@@ -230,18 +222,18 @@ begin
 end $t$;
 
 
--- 2. Какие заказы и в какой месяц попадают
+-- Проверяет отбор по статусу и дате доставки
 do $t$
 declare
     st order_status;
 begin
     perform tst.setup();
 
-    perform tst.mk_deliv('2026-03-01 00:00:00', 1000); -- ровно начало месяца: март
-    perform tst.mk_deliv('2026-02-28 23:59:59', 2000); -- за секунду до: февраль
-    perform tst.mk_deliv('2026-03-05 12:00', 3000, '2026-02-20 12:00'); -- создан в феврале, доставлен в марте: март
+    perform tst.mk_deliv('2026-03-01 00:00:00', 1000);
+    perform tst.mk_deliv('2026-02-28 23:59:59', 2000);
+    perform tst.mk_deliv('2026-03-05 12:00', 3000, '2026-02-20 12:00');
 
-    -- создан, готовится, в_доставке, отменён: ни в суммах, ни в диапазоне (раньше и позже доставленных)
+    -- Добавляет недоставленные заказы за пределами периода доставок
     for st in select e from unnest(enum_range(null::order_status)) e where e != 'доставлен' loop
         perform tst.mk_other(st, '2026-05-10');
         perform tst.mk_other(st, '2025-12-10');
@@ -258,12 +250,11 @@ begin
 end $t$;
 
 
--- 3. Суммы и комиссия
+-- Проверяет суммы заказов и комиссий
 do $t$
 begin
     perform tst.setup();
 
-    -- январь: 1000 -> 1100.00 и 1000.55 -> 1100.61; февраль: 3000 -> 3300
     perform tst.mk_deliv('2026-01-10 12:00', 1000);
     perform tst.mk_deliv('2026-01-20 12:00', 1000.55);
     perform tst.mk_deliv('2026-02-10 12:00', 3000);
@@ -278,7 +269,7 @@ begin
 end $t$;
 
 
--- 4. prev_commission и commission_diff: январь 200, февраль 0, март 100, апрель 500
+-- Сравнивает комиссии соседних месяцев
 do $t$
 begin
     perform tst.setup();
@@ -302,17 +293,17 @@ begin
 end $t$;
 
 
--- 5. courier_pay и net_profit: заказы в январе, феврале, апреле и июне
+-- Проверяет выплаты курьерам и чистую прибыль
 do $t$
 declare
     c1 uuid; c2 uuid;
 begin
     perform tst.setup();
 
-    perform tst.mk_deliv('2026-01-10 12:00', 2000); -- комиссия 200
-    perform tst.mk_deliv('2026-02-10 12:00', 1000); -- комиссия 100
-    perform tst.mk_deliv('2026-04-10 12:00', 1000); -- комиссия 100
-    perform tst.mk_deliv('2026-06-10 12:00', 1000); -- комиссия 100
+    perform tst.mk_deliv('2026-01-10 12:00', 2000);
+    perform tst.mk_deliv('2026-02-10 12:00', 1000);
+    perform tst.mk_deliv('2026-04-10 12:00', 1000);
+    perform tst.mk_deliv('2026-06-10 12:00', 1000);
 
     c1 := tst.mk_courier();
     c2 := tst.mk_courier();
@@ -320,8 +311,8 @@ begin
     perform tst.mk_pay(c1, 2026, 1, 50);
     perform tst.mk_pay(c2, 2026, 1, 30);
     perform tst.mk_pay(c1, 2026, 2, 150);
-    perform tst.mk_pay(c1, 2026, 5, 40); -- месяц без заказов
-    perform tst.mk_pay(c1, 2026, 7, 99); -- после последнего доставленного заказа
+    perform tst.mk_pay(c1, 2026, 5, 40); -- добавляет выплату за месяц без заказов
+    perform tst.mk_pay(c1, 2026, 7, 99); -- добавляет выплату после последней доставки
 
     perform tst.expect_true('выплаты: январь — сумма выплат всех курьеров, net_profit = комиссия − выплаты',
         $q$select courier_pay = 80 and net_profit = 120 from how_much_money where year_month = '2026-01'$q$);
@@ -343,7 +334,6 @@ begin
 end $t$;
 
 
--- Итог
 select count(*) filter (where ok) as passed,
        count(*) filter (where not ok) as failed,
        count(*) as total

@@ -10,7 +10,7 @@ language sql
 volatile
 set search_path = shkuratetskiy_food
 as $$
-    -- Доставленные заказы: однократное чтение таблицы order
+    -- Читает доставленные заказы один раз для всех расчётов
     with delivered_orders as materialized (
         select o.order_id,
                o.restaurant_id,
@@ -20,7 +20,6 @@ as $$
         where o.status = 'доставлен'
     ),
 
-    -- Количество и сумма заказов каждого клиента
     client_stats as (
         select d.restaurant_id,
                ca.client_id,
@@ -32,7 +31,6 @@ as $$
         group by d.restaurant_id, ca.client_id
     ),
 
-    -- Определение максимального количества заказов
     client_max as (
         select cs.*,
                max(cs.order_count) over (
@@ -41,7 +39,6 @@ as $$
         from client_stats cs
     ),
 
-    -- Финансовая статистика и кандидаты на лучшего клиента
     restaurant_stats as (
         select cm.restaurant_id,
                sum(cm.order_sum) as total_amount,
@@ -55,7 +52,6 @@ as $$
         group by cm.restaurant_id
     ),
 
-    -- Количество проданных блюд
     product_stats as (
         select d.restaurant_id,
                os.product_id,
@@ -66,7 +62,6 @@ as $$
         group by d.restaurant_id, os.product_id
     ),
 
-    -- Определение максимального количества продаж
     product_max as (
         select ps.*,
                max(ps.total_quantity) over (
@@ -75,7 +70,6 @@ as $$
         from product_stats ps
     ),
 
-    -- Кандидаты на самое покупаемое блюдо
     best_products as (
         select pm.restaurant_id,
                array_agg(pm.product_id) filter (
@@ -85,7 +79,7 @@ as $$
         group by pm.restaurant_id
     ),
 
-    -- Выбор победителей без случайной сортировки
+    -- Выбирает случайного кандидата при равенстве показателей
     selected as materialized (
         select r.restaurant_name,
                rs.total_amount,

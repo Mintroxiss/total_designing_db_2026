@@ -2,7 +2,6 @@ begin;
 
 set local search_path to shkuratetskiy_food, exts;
 
--- Только бизнес-логика get_statistic(). Рабочие данные не удаляются.
 create temp table statistic_test_result (
     id int generated always as identity primary key,
     test text not null,
@@ -17,8 +16,7 @@ returns void language sql as $$
             case when p_ok is not true then coalesce(p_details, 'условие ложно или NULL') end);
 $$;
 
--- Один вызов статистики на проверку. NULL в массиве аргументов не нужен:
--- NULL вместо массива означает, что соответствующая колонка должна быть NULL.
+-- Ожидает NULL в колонке при передаче NULL вместо массива
 create function pg_temp.expect_stat(
     p_test text, p_name text, p_products text[], p_total numeric,
     p_avg numeric, p_users text[]
@@ -50,7 +48,6 @@ exception when others then
 end;
 $$;
 
--- Минимальные валидные фикстуры по актуальной схеме.
 create function pg_temp.mk_rest(p_name text) returns uuid language plpgsql as $$
 declare
     a uuid;
@@ -112,7 +109,6 @@ begin
 end;
 $$;
 
--- Позиции могут быть множественными. Оплата и сумма заказа считаются штатно.
 create function pg_temp.mk_order(p_ca uuid, p_rest uuid, p_courier uuid,
                                 p_status order_status, p_products uuid[],
                                 p_qty numeric[], p_paid boolean default false)
@@ -144,7 +140,7 @@ begin
 end;
 $$;
 
--- 1. Финансы, лидеры, фильтр статусов, независимость ресторанов.
+-- Проверяет статистику доставленных заказов по ресторанам
 do $$
 declare
     prefix text := 'stat_' || replace(uuid_generate_v4()::text, '-', '');
@@ -177,9 +173,7 @@ begin
     p3 := pg_temp.mk_prod(r, 'extra', 5000);
     pn := pg_temp.mk_prod(r, 'noise');
 
-    -- Клиент 1: 3 заказа по 2750 с разных адресов (8250).
-    -- Клиент 2: 2 заказа на 7700 и 2200 (9900). Один заказ с двумя позициями.
-    -- many_orders: 3 шт. на 7500; big_qty: 4 шт. на 4000; extra: 1 шт. на 5000.
+    -- Первый клиент лидирует по числу заказов, второй — по сумме
     perform pg_temp.mk_order(a1, r, courier, 'доставлен', array[p1], array[1]::numeric[]);
     perform pg_temp.mk_order(a2, r, courier, 'доставлен', array[p1], array[1]::numeric[]);
     perform pg_temp.mk_order(a3, r, courier, 'доставлен', array[p1], array[1]::numeric[]);
@@ -189,8 +183,7 @@ begin
     perform pg_temp.expect_stat('финансы и лидеры: 5 заказов, разные адреса, несколько позиций',
                                n, array['big_qty'], 18150, 3630, array[u1]);
 
-    -- Все недоставленные статусы: шум мог бы победить по количеству и заказам.
-    -- Заказ в доставке уже оплачен: одного pay_status недостаточно.
+    -- Проверяет, что оплаченный заказ в доставке исключается из статистики
     for st in select unnest(enum_range(null::order_status)) loop
         if st <> 'доставлен' then
             perform pg_temp.mk_order(b, r, courier, st, array[pn], array[10]::numeric[], st = 'в_доставке');
@@ -199,13 +192,11 @@ begin
         end if;
     end loop;
 
-    -- Тот же клиент в другом ресторане; его заказы не смешиваются.
     po := pg_temp.mk_prod(r_other, 'other_dish');
     perform pg_temp.mk_order(b, r_other, courier, 'доставлен', array[po], array[10]::numeric[]);
     perform pg_temp.expect_stat('изоляция: другой ресторан', n_other, array['other_dish'], 11000, 11000, array[u2]);
     perform pg_temp.expect_stat('изоляция: исходный ресторан не изменился', n, array['big_qty'], 18150, 3630, array[u1]);
 
-    -- Цена в каталоге может измениться: статистика учитывает цену в заказе.
     update product set price = 9000 where product_id = p1;
     perform pg_temp.expect_stat('финансы: изменение цены в каталоге не меняет историю заказов',
                                n, array['big_qty'], 18150, 3630, array[u1]);
@@ -219,7 +210,7 @@ exception when others then
 end;
 $$;
 
--- 2. Дробное количество, округление среднего чека в обе стороны.
+-- Проверяет дробное количество и округление среднего чека
 do $$
 declare
     prefix text := 'stat_' || replace(uuid_generate_v4()::text, '-', '');
@@ -239,7 +230,6 @@ begin
     perform pg_temp.mk_order(a, r, courier, 'доставлен', array[p], array[3]::numeric[]);
     perform pg_temp.mk_order(a, r, courier, 'доставлен', array[q], array[1.9]::numeric[]);
     perform pg_temp.mk_order(a, r, courier, 'доставлен', array[q], array[1.9]::numeric[]);
-    -- 3.8 кг против 3 шт.; 3300 + 2090 + 2090 = 7480; avg = 2493.33.
     perform pg_temp.expect_stat('дробное количество и округление среднего вниз',
                                n, array['weight_dish'], 7480, 2493.33, array[u]);
 
@@ -256,8 +246,7 @@ exception when others then
 end;
 $$;
 
--- 3. Ничья: только кандидаты с максимумом, ровно одна строка на вызов.
--- Не требуем выпадения всех вариантов за конечное число вызовов.
+-- Проверяет, что при равенстве показателей выбран один из лидеров
 do $$
 declare
     prefix text := 'stat_' || replace(uuid_generate_v4()::text, '-', '');
@@ -307,13 +296,13 @@ begin
         end if;
     end loop;
     perform pg_temp.expect_true('ничья: 20 вызовов, одна строка, только лидеры, финансы неизменны', valid, bad);
-    raise notice 'Ничья (диагностика, не критерий успеха): блюда %, клиенты %', seen_products, seen_users;
+    raise notice 'Выбранные при равенстве блюда %, клиенты %', seen_products, seen_users;
 exception when others then
     perform pg_temp.expect_true('сценарий 3: ошибка подготовки или выполнения', false, sqlstate || ': ' || sqlerrm);
 end;
 $$;
 
--- 4. Названия ресторанов не уникальны: нельзя группировать по имени.
+-- Проверяет рестораны с одинаковым названием
 do $$
 declare
     prefix text := 'stat_' || replace(uuid_generate_v4()::text, '-', '');
@@ -348,10 +337,10 @@ exception when others then
 end;
 $$;
 
--- 5. Кардинальность результата по всей схеме (включая существующие данные).
+-- Проверяет, что каждому ресторану соответствует одна строка
 do $$
 begin
-    perform pg_temp.expect_true('одна строка на каждый ресторан (по названиям с учётом повторов)',
+    perform pg_temp.expect_true('одна строка на ресторан при совпадении названий',
         not exists (
             select restaurant_name
             from (

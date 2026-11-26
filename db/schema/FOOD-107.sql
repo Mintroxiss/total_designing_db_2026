@@ -3,8 +3,8 @@ language plpgsql
 set search_path = shkuratetskiy_food, exts
 as $$
 declare
-    ms date := date_trunc('month', localtimestamp)::date;   -- начало текущего месяца
-    me date := (date_trunc('month', localtimestamp) + interval '1 month')::date; -- начало следующего
+    ms date := date_trunc('month', localtimestamp)::date;
+    me date := (date_trunc('month', localtimestamp) + interval '1 month')::date;
 begin
     with stat as (
         select c.courier_id,

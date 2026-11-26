@@ -202,7 +202,7 @@ create unique index uq_address_physical
 
 -- ТРИГГЕРНЫЕ ФУНКЦИИ
 
--- Запрет заказа блюд из разных ресторанов в одном заказе
+-- Запрещает добавлять в заказ блюда из разных ресторанов
 create function check_order_product_restaurant()
 returns trigger
 language plpgsql
@@ -213,7 +213,7 @@ declare
 begin
     case tg_table_name
 
-        -- Добавление или изменение позиции заказа
+        -- Проверяет ресторан при добавлении или изменении позиции заказа
         when 'order_structure' then
 
             select restaurant_id
@@ -236,7 +236,7 @@ begin
                     using errcode = '23514';
             end if;
 
-        -- Изменение ресторана блюда
+        -- Проверяет состав заказов при смене ресторана блюда
         when 'product' then
 
             if exists (
@@ -254,7 +254,7 @@ begin
                     using errcode = '23514';
             end if;
 
-        -- Изменение ресторана заказа
+        -- Проверяет состав заказа при смене его ресторана
         when 'order' then
 
             if exists (
@@ -278,7 +278,7 @@ begin
 end;
 $$;
 
--- Автоматический пересчёт стоимости заказа при изменении его состава
+-- Пересчитывает стоимость заказа при изменении его состава
 create function update_order_amount()
 returns trigger
 language plpgsql
@@ -318,7 +318,7 @@ begin
 end;
 $$;
 
--- Сумма попытки оплаты равна общей сумме заказа
+-- Сверяет сумму попытки оплаты с общей суммой заказа
 create function check_payment_amount()
 returns trigger
 language plpgsql
@@ -359,7 +359,7 @@ begin
 
         when 'order' then
 
-            -- при изменении суммы заказа проверяются только успешные попытки оплаты
+            -- Проверяет только успешные попытки оплаты при изменении суммы заказа
             if exists (
                 select 1
                 from shkuratetskiy_food.payment
@@ -379,7 +379,7 @@ begin
 end;
 $$;
 
--- Агрегированный статус оплаты заказа вычисляется по попыткам оплаты
+-- Вычисляет статус оплаты заказа по попыткам оплаты
 create function update_order_pay_status()
 returns trigger
 language plpgsql
@@ -427,7 +427,7 @@ begin
 end;
 $$;
 
--- Клиент может оставить отзыв только на то, что он заказал
+-- Проверяет, что объект отзыва относится к заказу клиента
 create function check_review_entity()
 returns trigger
 language plpgsql
@@ -437,7 +437,7 @@ declare
 begin
     case tg_table_name
 
-        -- Добавление или изменение отзыва
+        -- Проверяет объект при добавлении или изменении отзыва
         when 'review' then
 
             select restaurant_id
@@ -489,7 +489,7 @@ begin
 
             end case;
 
-        -- Удаление или изменение позиции заказа
+        -- Защищает блюдо с отзывом при удалении или изменении позиции
         when 'order_structure' then
 
             if tg_op = 'UPDATE' then
@@ -516,7 +516,7 @@ begin
                 return old;
             end if;
 
-        -- Изменение ресторана заказа
+        -- Проверяет отзывы на ресторан при смене ресторана заказа
         when 'order' then
 
             if exists (
@@ -538,7 +538,7 @@ begin
 end;
 $$;
 
--- Проверка соответствия количества единице измерения блюда
+-- Проверяет соответствие количества единице измерения блюда
 create function check_product_quantity()
 returns trigger
 language plpgsql

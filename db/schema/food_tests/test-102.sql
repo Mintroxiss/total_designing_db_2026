@@ -1,8 +1,5 @@
--- FOOD-102: функциональные тесты insert_test_data(integer), PostgreSQL 15+.
--- Перед прогоном применить FOOD-101.sql и FOOD-102.sql.
--- Запускать целиком в тестовой БД, с правами на TRUNCATE/INSERT/SELECT/UPDATE.
--- Тестовые данные и вспомогательные объекты откатываются в конце.
--- Внимание: TRUNCATE удерживает блокировки до ROLLBACK.
+-- Требует установки FOOD-101.sql и FOOD-102.sql в тестовой базе
+-- TRUNCATE удерживает блокировки до отката
 
 begin;
 set local search_path to shkuratetskiy_food, exts, pg_temp;
@@ -16,7 +13,6 @@ create temp table result (
 
 create temp table snap (tbl text not null, row_data jsonb not null) on commit drop;
 
--- Инфраструктура: фиксируем результат, не прерывая остальные проверки.
 create function pg_temp.expect_true(p_test text, p_query text)
 returns void language plpgsql as $$
 declare
@@ -38,8 +34,7 @@ declare
 begin
     begin
         call shkuratetskiy_food.insert_test_data(p_n);
-        -- Если процедура не отклонила аргумент, откатываем её изменения,
-        -- но фиксируем FAIL (а не принимаем служебную ошибку за ожидаемую).
+        -- Служебное исключение откатывает неожиданный успешный вызов
         raise exception using errcode = 'ZX001', message = 'исключения не было';
     exception when query_canceled or others then
         get stacked diagnostics st = returned_sqlstate, msg = message_text;
@@ -97,7 +92,6 @@ begin
     end loop;
 end $$;
 
--- Независимый эталон коэффициента (число доставок за календарный месяц).
 create function pg_temp.coef(p_cnt bigint) returns numeric language sql immutable as $$
     select case when p_cnt > 500 then 0.5
                 when p_cnt > 250 then 0.3
@@ -105,8 +99,6 @@ create function pg_temp.coef(p_cnt bigint) returns numeric language sql immutabl
                 else 0.1 end;
 $$;
 
--- Проверяем результат генерации после каждого успешного вызова.
--- p_ns — размеры всех вызовов после очистки; p_label — имя сценария.
 create function pg_temp.verify(p_ns int[], p_label text) returns void language plpgsql as $$
 declare
     s bigint := (select sum(x) from unnest(p_ns) x);
@@ -115,7 +107,7 @@ declare
     w timestamp := date_trunc('month', localtimestamp) - interval '5 months';
     r record;
 begin
-    -- 1. Объёмы: число строк должно увеличиваться после каждого вызова.
+    -- Проверяет общее число строк после очередного вызова
     for r in select * from (values
         ('client', s), ('courier', s), ('product_category', s), ('restaurant', s),
         ('address', 5*s), ('client_address', 4*s), ('product', 5*s),
@@ -125,7 +117,7 @@ begin
             format('select count(*) = %s from %I', r.expected, r.t));
     end loop;
 
-    -- 2. Адреса, меню, состав заказов.
+    -- Проверяет адреса, меню и состав заказов
     perform pg_temp.expect_true(p_label || ': ровно 4 адреса у каждого клиента',
         $q$select not exists (select 1 from client c where
             (select count(*) from client_address a where a.client_id = c.client_id) <> 4)$q$);
@@ -148,12 +140,11 @@ begin
         $q$select not exists (select 1 from order_structure s join product p using (product_id)
             where p.status <> 'доступно' or s.price is distinct from p.price)$q$);
 
-    -- CHECK схемы не требует 1000 для созданных/отменённых заказов;
-    -- генератор обеспечивает минимальную сумму также и для этих статусов.
+    -- Генератор соблюдает минимум суммы в том числе для созданных и отменённых заказов
     perform pg_temp.expect_true(p_label || ': генератор обеспечивает сумму до комиссии не менее 1000',
         $q$select not exists (select 1 from "order" where order_amount < 1000 or total_amount < 1000)$q$);
 
-    -- 3. Статусы и назначения курьеров.
+    -- Проверяет статусы и назначения курьеров
     perform pg_temp.expect_true(p_label || ': минимум 2n доставленных заказов в новой партии',
         format($q$select count(*) >= %s from "order" o where o.status = 'доставлен'
             and not exists (select 1 from pg_temp.snap s where s.tbl = 'order'
@@ -187,7 +178,7 @@ begin
             where o.status = 'доставлен' and (o.order_timestamp::date < c.hire_date
                 or o.delivery_timestamp::date > coalesce(c.dismissal_date, 'infinity'::date)))$q$);
 
-    -- 4. Оплата. Ровно одна попытка (не обязательно успешная) на каждый заказ.
+    -- Проверяет наличие одной попытки оплаты на заказ с учётом его статуса
     perform pg_temp.expect_true(p_label || ': ровно одна попытка оплаты у каждого заказа',
         $q$select not exists (select 1 from "order" o left join payment p using (order_id)
             group by o.order_id having count(p.payment_id) <> 1)$q$);
@@ -197,7 +188,7 @@ begin
             where p.status is distinct from (case o.status when 'создан' then 'в_обработке'
                 when 'отменён' then 'ошибка' else 'успех' end)::payment_status)$q$);
 
-    -- 5. Даты: 6 календарных месяцев, а не now() - interval '6 months'.
+    -- Проверяет даты за шесть календарных месяцев
     perform pg_temp.expect_true(p_label || ': заказы в календарном окне, резерв 3 часа',
         format($q$select not exists (select 1 from "order" where order_timestamp
             not between %L::timestamp and localtimestamp - interval '3 hours')$q$, w));
@@ -221,7 +212,7 @@ begin
                         and old.row_data->>'order_id' = o.order_id::text)))$q$);
     end if;
 
-    -- 6. Единая таблица review. Проверка охвата именно новой партии.
+    -- Проверяет охват отзывами новой партии
     perform pg_temp.expect_true(p_label || ': в новой партии отзывы всех 3 типов',
         $q$select count(distinct r.entity_type) = 3 from review r where not exists (
             select 1 from pg_temp.snap s where s.tbl = 'review'
@@ -233,8 +224,7 @@ begin
                or r.review_timestamp not between o.delivery_timestamp and o.delivery_timestamp + interval '1 hour'
                or r.review_timestamp > localtimestamp)$q$);
 
-    -- 7. Выплаты. Актуальная процедура группирует по delivery_timestamp,
-    -- не по order_timestamp (в протоколе C.8 приведена другая формула).
+    -- Сверяет выплаты с заказами по месяцу доставки
     perform pg_temp.expect_true(p_label || ': выплата каждому курьеру за каждый из 6 месяцев',
         $q$select not exists (select 1 from courier c cross join generate_series(0,5) g
             left join courier_pay p on p.courier_id = c.courier_id
@@ -266,8 +256,7 @@ begin
             group by courier_id) o using (courier_id)
             where c.coefficient is distinct from pg_temp.coef(coalesce(o.cnt,0)))$q$);
 
-    -- 8. Качество генерации, а не ограничения типа/NOT NULL.
-    -- BR-11.3: заполненные текстовые поля не должны быть пустыми.
+    -- Проверяет отсутствие пустых строк по BR-11.3
     for r in select table_name t, column_name c from information_schema.columns
         where table_schema = 'shkuratetskiy_food'
           and table_name = any(pg_temp.tables())
@@ -290,16 +279,14 @@ begin
             ) generated_text
             where value !~ '^[абвгдеёжзийклмнопрстуфхцчшщъыьэюя]+$')$q$);
 
-    -- Не проверяем обязательность NULL вообще: это свойство схемы.
-    -- Проверяем только намеренное разнообразие опциональных полей генератора.
+    -- Проверяет наличие NULL и заполненных значений в опциональных полях
     for r in select * from (values ('address','apartment_office'),
         ('product','photo_url'), ('review','photo_url')) v(t,c) loop
         perform pg_temp.expect_true(format('%s: %s.%s — есть NULL и непустые значения',p_label,r.t,r.c),
             format('select exists (select 1 from %1$I where %2$I is null) and exists (select 1 from %1$I where %2$I is not null)',r.t,r.c));
     end loop;
 
-    -- Покрытие enum-значений является свойством генератора, а не проверкой DDL.
-    -- При n >= 5 все перечисленные статусы гарантированно встречаются.
+    -- Проверяет полный набор значений enum при n от 5
     if n >= 5 then
         for r in select * from (values
             ('payment','payment_type','payment_type'), ('payment','status','payment_status'),
@@ -315,7 +302,7 @@ begin
         end loop;
     end if;
 
-    -- Перекос — устойчивые нижние границы, а не точные случайные проценты.
+    -- Проверяет минимальные доли доставок у ведущих курьеров
     if n >= 60 and cardinality(p_ns) = 1 then
         perform pg_temp.expect_true(p_label || ': топ-1 курьер выполняет не менее 20% доставок',
             $q$select coalesce(max(cnt),0)*5 >= sum(cnt) from (
@@ -327,8 +314,7 @@ begin
     end if;
 end $$;
 
--- Сценарий: из пустой схемы, затем добавление без очистки.
--- При повторных вызовах проверяем и прирост, и полную сохранность старых строк.
+-- Повторно запускает генерацию и проверяет сохранность прежних строк
 create function pg_temp.run(p_ns int[], p_label text, p_same_seed boolean default false)
 returns void language plpgsql as $$
 declare
@@ -355,7 +341,7 @@ begin
     end loop;
 end $$;
 
--- 9. Некорректные аргументы: именно заявленная ошибка процедуры, включая NULL.
+-- Проверяет обработку некорректных аргументов
 select pg_temp.wipe();
 set local statement_timeout = '5s';
 do $$
@@ -367,8 +353,7 @@ begin
 end $$;
 set local statement_timeout = 0;
 
--- 10. Матрица сценариев. До июня 2026 года процедура явно отклоняет
--- даже положительный аргумент из-за ограничения календарного окна.
+-- Запускает положительные сценарии с июня 2026 года
 do $$
 begin
     if date_trunc('month',localtimestamp)-interval '5 months' < date '2026-01-01' then
@@ -384,16 +369,13 @@ begin
         perform pg_temp.run(array[60],'распределение доставок');
         perform pg_temp.run(array[1,10,5],'повторные вызовы разных размеров');
         perform pg_temp.run(array_fill(10,array[11]),'FOOD-102: первый вызов и 10 повторов');
-        -- Повторяем random()-последовательность, чтобы провоцировать коллизии телефонов.
-        -- UUID не зависят от setseed; этот сценарий не доказывает охват retry-ветки.
+        -- Одинаковый seed повышает вероятность коллизий телефонов
         perform pg_temp.run(array[10,10],'повтор с одинаковым seed',true);
     end if;
 end $$;
 
--- 11. Тяжёлый функциональный сценарий (как в старом наборе):
--- проверяет реальные выплаты с коэффициентом > 0.1, а не скорость работы.
--- Для быстрого прогона можно изменить true на false.
--- Полное покрытие всех порогов зависит от распределения доставок по месяцам.
+-- Проверяет фактические выплаты с повышенным коэффициентом
+-- Пропускает сценарий при замене true на false
 set local statement_timeout = '3600s';
 do $$
 begin
@@ -405,7 +387,6 @@ begin
 end $$;
 set local statement_timeout = 0;
 
--- Итог: подробности только для непройденных тестов.
 select count(*) filter (where ok) as passed,
        count(*) filter (where not ok) as failed,
        count(*) as total

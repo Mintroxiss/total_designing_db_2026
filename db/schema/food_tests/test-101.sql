@@ -1,7 +1,4 @@
--- Тесты логики триггеров актуальной схемы shkuratetskiy_food (PostgreSQL 15+).
--- Запускать целиком в тестовой БД после установки DDL. Данные не очищаются.
--- Проверяются 6 триггерных функций через реальные INSERT / UPDATE / DELETE.
--- PK, FK, UNIQUE, CHECK, NOT NULL, индексы и generated columns отдельно не тестируются.
+-- Проверяет триггеры после установки FOOD-101.sql в тестовой базе
 begin;
 set local search_path to shkuratetskiy_food, exts, pg_temp;
 
@@ -12,8 +9,7 @@ create temp table result (
     details text
 ) on commit drop;
 
--- Один сценарий = одна запись. При неожиданном успехе или неверном результате
--- откатываем операцию во вложенной транзакции, чтобы не портить следующие тесты.
+-- Вложенная транзакция откатывает операцию при провале проверки
 create function pg_temp.expect(p_test text, p_sql text, p_check text default null,
                                p_state text default null, p_msg text default null)
 returns void language plpgsql as $$
@@ -48,7 +44,6 @@ begin
     insert into pg_temp.result(test, ok) values (p_test, true);
 end $$;
 
--- Минимальные фикстуры. UUID нужны только для изоляции от существующих данных.
 create function pg_temp.mk_address() returns uuid language plpgsql as $$
 declare v_id uuid := exts.uuid_generate_v4();
 begin
@@ -130,7 +125,7 @@ returns text language sql as $$
                   p_id,p_o,p_type,p_entity)
 $$;
 
--- 1. check_order_product_restaurant: все три направления проверки
+-- Проверяет принадлежность блюд ресторану заказа
 do $t$
 declare
     r uuid; r2 uuid; ca uuid; o uuid; o2 uuid; empty_o uuid; p uuid; p2 uuid; free_p uuid;
@@ -164,7 +159,7 @@ exception when others then
     insert into pg_temp.result(test, ok, details) values ('Ресторан: ошибка подготовки/сценария', false, sqlstate || ': ' || sqlerrm);
 end $t$;
 
--- 2. update_order_amount: INSERT / UPDATE / DELETE, обе стороны переноса
+-- Проверяет пересчёт суммы при изменении и переносе позиций
 do $t$
 declare
     r uuid; ca uuid; o uuid; o2 uuid; p uuid; p2 uuid; p3 uuid;
@@ -208,7 +203,7 @@ exception when others then
     insert into pg_temp.result(test, ok, details) values ('Сумма: ошибка подготовки/сценария', false, sqlstate || ': ' || sqlerrm);
 end $t$;
 
--- 3. check_product_quantity: количество и смена единицы измерения
+-- Проверяет соответствие количества единице измерения
 do $t$
 declare
     r uuid; ca uuid; o uuid; o2 uuid; piece uuid; kg uuid; litre uuid; free_p uuid;
@@ -261,7 +256,7 @@ exception when others then
     insert into pg_temp.result(test, ok, details) values ('Количество: ошибка подготовки/сценария', false, sqlstate || ': ' || sqlerrm);
 end $t$;
 
--- 4. check_payment_amount: сумма оплаты, исторические попытки, блокировка оплаченного заказа
+-- Проверяет суммы попыток оплаты и защиту оплаченного заказа
 do $t$
 declare
     r uuid; ca uuid; o uuid; o2 uuid; p uuid; p2 uuid; failed uuid := exts.uuid_generate_v4(); pending uuid := exts.uuid_generate_v4();
@@ -270,7 +265,7 @@ begin
     r := pg_temp.mk_rest(); ca := pg_temp.mk_ca(); o := pg_temp.mk_order(ca,r); o2 := pg_temp.mk_order(ca,r);
     p := pg_temp.mk_product(r); p2 := pg_temp.mk_product(r);
     execute pg_temp.item_sql(o,p,2); execute pg_temp.item_sql(o2,p,3);
-    perform pg_temp.expect('Оплата: INSERT неверной суммы (выше допустимого минимума)',
+    perform pg_temp.expect('Оплата: сумма выше минимума, но отличается от суммы заказа',
         pg_temp.pay_sql(spare, o, 2100, 'в_обработке'), p_state => '23514', p_msg => 'не соответствует общей сумме заказа');
     perform pg_temp.expect('Оплата: INSERT корректной неуспешной попытки',
         pg_temp.pay_sql(failed, o, 2200, 'ошибка'),
@@ -331,7 +326,7 @@ exception when others then
     insert into pg_temp.result(test, ok, details) values ('Сумма оплаты: ошибка подготовки/сценария', false, sqlstate || ': ' || sqlerrm);
 end $t$;
 
--- 5. update_order_pay_status: приоритеты, смена статуса, перенос, удаление
+-- Проверяет пересчёт статуса оплаты
 do $t$
 declare
     r uuid; ca uuid; o uuid; o2 uuid; p uuid; a uuid := exts.uuid_generate_v4(); b uuid := exts.uuid_generate_v4(); c uuid := exts.uuid_generate_v4();
@@ -381,9 +376,8 @@ exception when others then
     insert into pg_temp.result(test, ok, details) values ('Статус оплаты: ошибка подготовки/сценария', false, sqlstate || ': ' || sqlerrm);
 end $t$;
 
--- 6. check_review_entity: три типа отзывов, INSERT и UPDATE
--- Статус «создан» выбран специально: актуальный триггер проверяет принадлежность
--- объекта заказу, а не факт доставки; успешная оплата не должна маскировать проверки.
+-- Проверяет принадлежность объекта отзыва заказу
+-- Статус «создан» изолирует проверку принадлежности от условий оплаты
 do $t$
 declare
     r uuid; r2 uuid; ca uuid; o uuid; o2 uuid; p uuid; p2 uuid; p3 uuid;
@@ -430,7 +424,7 @@ exception when others then
     insert into pg_temp.result(test, ok, details) values ('Объект отзыва: ошибка подготовки/сценария', false, sqlstate || ': ' || sqlerrm);
 end $t$;
 
--- 7. check_review_entity: защита связанных объектов при обратных изменениях
+-- Проверяет защиту объектов с отзывами при изменении заказа
 do $t$
 declare
     r uuid; r2 uuid; ca uuid; o uuid; o2 uuid; o3 uuid; p uuid; p2 uuid; p3 uuid;
@@ -441,7 +435,7 @@ begin
     p := pg_temp.mk_product(r); p2 := pg_temp.mk_product(r); p3 := pg_temp.mk_product(r);
     execute pg_temp.item_sql(o,p); execute pg_temp.item_sql(o,p2);
     execute pg_temp.review_sql(rp,o,'блюдо',p);
-    -- Пустой заказ с отзывом на ресторан изолирует этот триггер от проверки состава.
+    -- Пустой заказ изолирует проверку отзыва от проверки состава
     execute pg_temp.review_sql(rr,o3,'ресторан',r);
     perform pg_temp.expect('Отзыв: DELETE позиции с отзывом',
         format($q$delete from order_structure where order_id = %L and product_id = %L$q$, o, p), p_state => '23514', p_msg => 'существует отзыв');
@@ -476,7 +470,6 @@ exception when others then
     insert into pg_temp.result(test, ok, details) values ('Защита объекта отзыва: ошибка подготовки/сценария', false, sqlstate || ': ' || sqlerrm);
 end $t$;
 
--- Итог: одна строка со счётчиками и отдельный вывод только ошибок.
 select count(*) filter (where ok) as passed,
        count(*) filter (where not ok) as failed,
        count(*) as total

@@ -2,8 +2,6 @@ begin;
 
 set local search_path to shkuratetskiy_food, exts;
 
--- Тестируем только значения агрегированных рейтингов после DML на review.
--- Все тестовые данные и вспомогательные объекты откатываются в конце.
 create temp table rating_test_result (
     id      int generated always as identity primary key,
     test    text not null,
@@ -39,7 +37,6 @@ begin
 end;
 $$;
 
--- Минимальные валидные данные для существующих ограничений схемы.
 create function pg_temp.mk_rest() returns uuid language plpgsql as $$
 declare
     a uuid;
@@ -78,7 +75,6 @@ declare
     a  uuid;
     ca uuid;
 begin
-    -- Не предполагаем, что рабочая схема пуста.
     loop
         insert into client(login, password, phone_number)
         values ('test_' || replace(uuid_generate_v4()::text, '-', ''),
@@ -127,8 +123,7 @@ end;
 $$;
 
 
--- 1. INSERT, UPDATE, DELETE: одинаковая логика для блюда и ресторана.
--- Проверяем среднее, округление вверх/вниз, дробную оценку и NULL.
+-- Проверяет рейтинг блюда и ресторана после вставки, изменения и удаления отзыва
 do $$
 declare
     k entity_type;
@@ -174,8 +169,8 @@ end;
 $$;
 
 
--- 2. UPDATE entity_id: перенос отзыва между сущностями одного типа.
--- Для ресторана одновременно меняем order_id, чтобы отзыв оставался валидным.
+-- Проверяет перенос отзыва между объектами одного типа
+-- Меняет заказ при смене ресторана, чтобы сохранить допустимую связь
 do $$
 declare
     k entity_type;
@@ -232,9 +227,8 @@ end;
 $$;
 
 
--- 3. UPDATE entity_type: все переходы между блюдом, рестораном и заказом.
--- Блюдо и ресторан намеренно имеют одинаковый UUID: тип тоже является
--- частью идентификатора объекта отзыва. Отзывы на заказ не входят в рейтинг.
+-- Проверяет переходы между типами отзывов
+-- Использует одинаковый UUID у блюда и ресторана
 do $$
 declare
     ca uuid; r uuid; p uuid; o_base uuid; o uuid; rv uuid;
@@ -259,7 +253,6 @@ begin
     perform pg_temp.expect_rating('UPDATE отзыва на заказ: блюдо', 'блюдо', p, 2.00);
     perform pg_temp.expect_rating('UPDATE отзыва на заказ: ресторан', 'ресторан', r, 3.00);
 
-    -- В каждом переходе оценка переносимого отзыва равна 5.
     for step in
         select * from (values
             (1, 'заказ -> блюдо',    'блюдо'::entity_type,    p, 3.50, 3.00),
@@ -289,7 +282,6 @@ end;
 $$;
 
 
--- Итог: 48 проверок при успешном выполнении всех сценариев.
 select count(*) filter (where ok) as passed,
        count(*) filter (where not ok) as failed,
        count(*) as total

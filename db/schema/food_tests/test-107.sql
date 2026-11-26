@@ -13,11 +13,9 @@ create table tst.result (
 
 create sequence tst.seq;
 
--- общие объекты сценария: адрес клиента, ресторан, два блюда
 create table tst.ctx (ca uuid, rest uuid, prod uuid, odd uuid);
 
 
--- Инфраструктура
 create function tst.expect_true(p_test text, p_query text)
 returns void language plpgsql as $$
 declare
@@ -46,7 +44,6 @@ begin
 end $$;
 
 
--- вызов процедуры с записью результата без исключений
 create function tst.salary(p_test text) returns void language plpgsql as $$
 begin
     call shkuratetskiy_food.courier_salary();
@@ -56,7 +53,6 @@ exception when others then
 end $$;
 
 
--- Построители данных. Всё идёт через обычные insert: order_amount и pay_status считают триггеры
 create function tst.mk_rest(p_name text) returns uuid language plpgsql as $$
 declare
     a uuid;
@@ -123,7 +119,6 @@ begin
 end $$;
 
 
--- заказ с одной позицией; курьер назначается до смены статуса
 create function tst.mk_order(p_ca uuid, p_rest uuid, p_status order_status,
                              p_prod uuid, p_qty numeric, p_courier uuid, p_ts timestamp)
 returns uuid language plpgsql as $$
@@ -155,7 +150,6 @@ begin
 end $$;
 
 
--- чистая база + общие объекты сценария
 create function tst.setup() returns void language plpgsql as $$
 declare
     r uuid;
@@ -184,14 +178,13 @@ begin
 end $$;
 
 
--- увольнять надо после назначения заказов: на уволенного курьера заказ назначить нельзя
+-- Увольняет курьера после назначения заказов
 create function tst.dismiss(p_courier uuid) returns void language plpgsql as $$
 begin
     update courier set status = 'уволен', dismissal_date = current_date where courier_id = p_courier;
 end $$;
 
 
--- заказ курьеру; для доставленного время доставки = p_ts
 create function tst.mk_assigned(p_courier uuid, p_status order_status, p_ts timestamp default null,
                                 p_qty numeric default 1, p_prod uuid default null)
 returns uuid language plpgsql as $$
@@ -205,7 +198,7 @@ begin
 end $$;
 
 
--- p_n доставленных заказов в текущем месяце, комиссия каждого = 100.00.
+-- Создаёт доставки с комиссией 100 за заказ
 create function tst.mk_deliv(p_courier uuid, p_n int, p_ts timestamp default null) returns void language plpgsql as $$
 begin
     if p_n <= 0 then
@@ -218,7 +211,7 @@ begin
 end $$;
 
 
--- 1. Что считается: только доставленные заказы курьера внутри текущего месяца
+-- Проверяет статусы заказов и границы месяца доставки
 do $t$
 declare
     ms timestamp := date_trunc('month', localtimestamp);
@@ -231,11 +224,10 @@ begin
     cb := tst.mk_courier(0.1);
 
     perform tst.mk_deliv(ca, 3);
-    perform tst.mk_assigned(ca, 'доставлен', ms); -- ровно начало месяца: входит
-    perform tst.mk_assigned(ca, 'доставлен', ms - interval '1 second'); -- прошлый месяц: не входит
-    perform tst.mk_assigned(ca, 'доставлен', me); -- начало следующего: не входит
+    perform tst.mk_assigned(ca, 'доставлен', ms);
+    perform tst.mk_assigned(ca, 'доставлен', ms - interval '1 second');
+    perform tst.mk_assigned(ca, 'доставлен', me);
 
-    -- создан, готовится, в_доставке, отменён: не входят
     for st in select e from unnest(enum_range(null::order_status)) e where e != 'доставлен' loop
         perform tst.mk_assigned(ca, st, null, 5);
     end loop;
@@ -252,8 +244,7 @@ begin
 end $t$;
 
 
--- 2. Пороги нового коэффициента: один курьер, число доставок растёт по ходу вызовов.
---    Перед каждым вызовом коэффициент сбрасывается в 0.5, чтобы изменение было заметно.
+-- Проверяет пороги коэффициента
 do $t$
 declare
     c   uuid;
@@ -278,7 +269,7 @@ begin
 end $t$;
 
 
--- 3. Зарплата и применённый коэффициент
+-- Проверяет сумму выплаты и применённый коэффициент
 do $t$
 declare
     po uuid; c1 uuid; c2 uuid; c3 uuid; h text;
@@ -291,11 +282,10 @@ begin
     c2 := tst.mk_courier(0.5);
     c3 := tst.mk_courier(0.3);
 
-    perform tst.mk_deliv(c1, 10); -- комиссии 1000
-    perform tst.mk_deliv(c2, 2); -- комиссии 200
-    perform tst.mk_assigned(c3, 'доставлен', null, 1, po); -- комиссия 100.05: 0.3 * 100.05 = 30.015
+    perform tst.mk_deliv(c1, 10);
+    perform tst.mk_deliv(c2, 2);
+    perform tst.mk_assigned(c3, 'доставлен', null, 1, po);
 
-    -- запись за прошлый месяц: не должна измениться
     insert into courier_pay(year, month, courier_id, amount, coefficient_used)
     select extract(year from d)::int, extract(month from d)::int, c1, 777, 0.2
     from (select date_trunc('month', localtimestamp) - interval '1 month' as d) x;
@@ -311,13 +301,13 @@ begin
     perform tst.expect_true('зарплата: другой коэффициент — другая сумма',
         format('select count(*) = 1 and bool_and(amount = 100 and coefficient_used = 0.5) from courier_pay where courier_id = %L and %s', c2, cur));
 
-    perform tst.expect_true('зарплата: amount округляется до 2 знаков (30.015 -> 30.02)',
+    perform tst.expect_true('зарплата: округление 30.015 до 30.02',
         format('select count(*) = 1 and bool_and(amount = 30.02) from courier_pay where courier_id = %L and %s', c3, cur));
 
     perform tst.expect_true('зарплата: запись за прошлый месяц не изменилась и не продублировалась',
         format('select count(*) = 1 and (select count(*) from courier_pay where courier_id = %1$L) = 2 from courier_pay where courier_id = %1$L and amount = 777 and coefficient_used = 0.2', c1));
 
-    perform tst.expect_true('коэффициент: у работающего курьера обновлён по числу доставок (10 -> 0.1)',
+    perform tst.expect_true('коэффициент: 0.1 после 10 доставок',
         format('select coefficient = 0.1 from courier where courier_id = %L', c1));
 
     perform tst.expect_true('коэффициент: обновлён у всех работающих курьеров',
@@ -328,7 +318,7 @@ begin
 end $t$;
 
 
--- 4. Уволенные курьеры: зарплата начисляется, коэффициент не трогается
+-- Проверяет выплату за месяц увольнения
 do $t$
 declare
     d uuid; e uuid;
@@ -348,7 +338,7 @@ begin
     perform tst.expect_true('уволенный: запись в courier_pay создана',
         format('select count(*) = 1 and bool_and(amount = 300 and coefficient_used = 0.3) from courier_pay where courier_id = %L and %s', d, cur));
 
-    perform tst.expect_true('уволенный: coefficient не изменился (по доставкам было бы 0.1)',
+    perform tst.expect_true('уволенный: коэффициент остался 0.3',
         format('select coefficient = 0.3 from courier where courier_id = %L', d));
 
     perform tst.expect_true('уволенный: контроль — у работающего с теми же данными coefficient обновился',
@@ -356,7 +346,7 @@ begin
 end $t$;
 
 
--- 5. Повторный вызов за тот же месяц
+-- Проверяет пересчёт выплаты после добавления доставок
 do $t$
 declare
     c uuid;
@@ -371,7 +361,6 @@ begin
     perform tst.expect_true('повтор: после первого вызова amount = 300, coefficient_used = 0.3',
         format('select count(*) = 1 and bool_and(amount = 300 and coefficient_used = 0.3) from courier_pay where courier_id = %L and %s', c, cur));
 
-    -- между вызовами появились ещё доставки (всего 15, комиссии 1500)
     perform tst.mk_deliv(c, 5);
 
     perform tst.salary('повтор: второй вызов без исключений');
@@ -379,7 +368,7 @@ begin
     perform tst.expect_true('повтор: запись обновлена, а не продублирована',
         format('select count(*) = 1 from courier_pay where courier_id = %L and %s', c, cur));
 
-    perform tst.expect_true('повтор: amount пересчитан по новым доставкам, coefficient_used остался коэффициентом месяца (0.3, а не новым 0.1)',
+    perform tst.expect_true('повтор: выплата пересчитана с коэффициентом 0.3',
         format('select amount = 450 and coefficient_used = 0.3 from courier_pay where courier_id = %L and %s', c, cur));
 
     perform tst.expect_true('повтор: courier.coefficient соответствует числу доставок',
@@ -392,7 +381,7 @@ begin
 end $t$;
 
 
--- 6. Курьер без доставок и пустая таблица курьеров
+-- Проверяет расчёт при отсутствии доставок и при отсутствии курьеров
 do $t$
 declare
     z uuid;
@@ -417,7 +406,6 @@ begin
 end $t$;
 
 
--- Итог
 select count(*) filter (where ok) as passed,
        count(*) filter (where not ok) as failed,
        count(*) as total

@@ -2,8 +2,7 @@ begin;
 
 set local search_path to shkuratetskiy_food, exts;
 
--- Автоматический пересчёт агрегированного рейтинга
--- блюда или ресторана при изменении отзывов
+-- Пересчитывает рейтинг блюда или ресторана при изменении отзывов
 create or replace function rating_change()
 returns trigger
 language plpgsql
@@ -16,7 +15,6 @@ declare
     v_entity_type     shkuratetskiy_food.entity_type;
     v_entity_id       uuid;
 begin
-    -- Определение затронутых сущностей
     case tg_op
         when 'INSERT' then
             v_new_entity_type := new.entity_type;
@@ -33,7 +31,6 @@ begin
             v_old_entity_id   := old.entity_id;
     end case;
 
-    -- Пересчёт рейтингов уникальных затронутых сущностей
     for v_entity_type, v_entity_id in
         select distinct e.entity_type, e.entity_id
         from (

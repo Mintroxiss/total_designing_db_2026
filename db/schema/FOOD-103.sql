@@ -5,7 +5,7 @@ as $$
 begin
     delete from review;
 
-    -- Отмена заказов для корректного удаления оплат и позиций
+    -- Отменяет заказы перед удалением оплат и позиций
     update "order"
        set status = 'отменён',
            delivery_timestamp = null

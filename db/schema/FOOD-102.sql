@@ -38,12 +38,11 @@ begin
         raise exception 'value должно быть >= 1';
     end if;
 
-    -- В текущей схеме courier_pay.year >= 2026.
+    -- Проверяет, что окно выплат укладывается в допустимые годы courier_pay
     if w::date < date '2026-01-01' then
         raise exception 'Схема courier_pay не допускает все 6 месяцев до 2026 года';
     end if;
 
-    -- product_category
     cat := array(select exts.uuid_generate_v4() from generate_series(1, n));
     insert into product_category(product_category_id, product_category_name)
     select id, (
@@ -52,7 +51,6 @@ begin
     )
     from unnest(cat) u(id);
 
-    -- courier: первые n - nf остаются активными, остальные увольняются после заказов.
     cou := array(select exts.uuid_generate_v4() from generate_series(1, n));
     act := cou[1 : n - nf];
     insert into courier(courier_id, last_name, first_name, middle_name, phone_number,
@@ -70,7 +68,7 @@ begin
         ) letters
     ) names;
 
-    -- При совпадении физического адреса заново генерируем его текстовые поля.
+    -- Генерирует адрес заново при совпадении
     adr := array(select exts.uuid_generate_v4() from generate_series(1, 5 * n));
     tmp := adr;
     while cardinality(tmp) > 0 loop
@@ -95,7 +93,7 @@ begin
                      where not exists (select 1 from inserted where address_id = id)) into tmp;
     end loop;
 
-    -- restaurant: первые n адресов.
+    -- Резервирует первые n адресов для ресторанов
     rst := array(select exts.uuid_generate_v4() from generate_series(1, n));
     insert into restaurant(restaurant_id, restaurant_name, address_id, description,
                            work_start, work_end, inn, ogrn, bank_account, status)
@@ -113,7 +111,6 @@ begin
            rs[1 + (i - 1)::int % cardinality(rs)]
     from unnest(rst) with ordinality u(id, i);
 
-    -- client: повторяем вставку при совпадении уникального номера/логина.
     while cardinality(cli) < n loop
         with ids as materialized (
             select exts.uuid_generate_v4() as id
@@ -131,13 +128,13 @@ begin
         cli := cli || tmp;
     end loop;
 
-    -- client_address: оставшиеся 4n адресов, ровно 4 на клиента.
+    -- Распределяет оставшиеся адреса по четыре на клиента
     cad := array(select exts.uuid_generate_v4() from generate_series(1, 4 * n));
     insert into client_address(client_address_id, client_id, address_id)
     select id, cli[1 + (i - 1)::int % n], adr[n + i::int]
     from unnest(cad) with ordinality u(id, i);
 
-    -- product: 5 блюд на ресторан, минимум одно доступное.
+    -- Гарантирует хотя бы одно доступное блюдо на ресторан
     prd := array(select exts.uuid_generate_v4() from generate_series(1, 5 * n));
     insert into product(product_id, product_name, product_category_id, price, restaurant_id,
                         photo_url, status, description, measure_unit)
@@ -156,7 +153,7 @@ begin
            ), mu[1 + (i - 1)::int % cardinality(mu)]
     from unnest(prd) with ordinality u(id, i);
 
-    -- order: минимум 2n доставленных, остальные статусы циклически из enum_range.
+    -- Генерирует минимум 2n доставленных заказов для 5n отзывов
     ords := array(select exts.uuid_generate_v4() from generate_series(1, 5 * n));
     sts := array(
         select case when g <= 2 * n then os[array_position(os, 'доставлен')]
@@ -164,8 +161,7 @@ begin
         from generate_series(1, 5 * n) g order by g
     );
 
-    -- Сначала заказ без позиций и оплаты должен иметь статус «создан».
-    -- Стратификация времени распределяет заказы по всему интервалу.
+    -- Распределяет заказы по всему временному окну
     insert into "order"(order_id, client_address_id, restaurant_id, order_timestamp, status, description)
     select id, cad[1 + (i - 1)::int % (4 * n)], rst[1 + (i - 1)::int % n],
            w + ((i - 1 + random()) / (5.0 * n)) * (t - interval '3 hours' - w),
@@ -175,8 +171,7 @@ begin
            )
     from unnest(ords) with ordinality u(id, i);
 
-    -- order_structure: 1–5 доступных блюд ресторана заказа.
-    -- Первая позиция гарантирует сумму заказа >= 1000, количество для шт — целое.
+    -- Доводит сумму заказа до установленного минимума за счёт первой позиции
     with o as materialized (
         select order_id, restaurant_id, 1 + floor(random() * 5)::int as k
         from "order" where order_id = any(ords)
@@ -193,7 +188,7 @@ begin
            case when rn = 1 then greatest(q, ceil(1000 / price)) else q end, price
     from items where rn <= k;
 
-    -- При совпадении transaction_id повторяем вставку только для заказов без платежа.
+    -- Повторяет вставку для пропущенных заказов при совпадении transaction_id
     tmp := ords;
     while cardinality(tmp) > 0 loop
         with inserted as (
@@ -218,8 +213,8 @@ begin
                      where not exists (select 1 from inserted where order_id = id)) into tmp;
     end loop;
 
-    -- Триггер payment уже установил pay_status. Теперь можно доставить заказ.
-    -- 30/20/10% доставок первым трём курьерам, остальное случайно.
+    -- Переводит заказ в статус «доставлен» после успешной оплаты
+    -- Выделяет первым трём курьерам 30%, 20% и 10% доставок, остальные распределяет случайно
     with x as (
         select id, st, (row_number() over (partition by st order by i) - 1) % 10 as r
         from unnest(ords, sts) with ordinality u(id, st, i)
@@ -237,7 +232,7 @@ begin
                o.order_timestamp + (30 + floor(random() * 90)::int) * interval '1 minute' end
     from x where o.order_id = x.id and x.st <> 'создан';
 
-    -- Увольнение только после последней доставки; при n >= 1 остаётся активный курьер.
+    -- Увольняет курьеров после назначения всех заказов
     update courier c
        set status = cs_all[array_position(cs_all, 'уволен')],
            dismissal_date = coalesce((select max(o.delivery_timestamp)::date
@@ -248,9 +243,8 @@ begin
         raise exception 'Требуется хотя бы один активный курьер';
     end if;
 
-    -- review: 3 вида объектов в одной таблице, только фактически заказанные объекты.
-    -- 2n доставленных заказов дают минимум 6n кандидатов, из них берём ровно 5n.
-    -- Рейтинги блюд и ресторанов обновляет триггер FOOD-105.
+    -- Формирует минимум 6n кандидатов на отзывы из 2n доставок
+    -- Рейтинги блюд и ресторанов обновляет триггер FOOD-105
     with d as materialized (
         select order_id, restaurant_id, delivery_timestamp
         from "order" where order_id = any(ords) and status = 'доставлен'
@@ -279,8 +273,7 @@ begin
            round((1 + random() * 4)::numeric, 1)
     from picked;
 
-    -- courier_pay: шесть календарных месяцев, включая текущий.
-    -- Идём от старого месяца к новому; сначала выплата, затем новый коэффициент.
+    -- Рассчитывает выплату за месяц, затем обновляет коэффициент
     for m in 0..5 loop
         ms := (w + m * interval '1 month')::date;
 
