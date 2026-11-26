@@ -5,6 +5,7 @@ erDiagram
         varchar login
         varchar password
         char phone_number
+        timestamp deleted_at
     }
     ADDRESS {
         uuid address_id PK
@@ -24,21 +25,18 @@ erDiagram
         text description
         time work_start
         time work_end
-        text company_details
+        varchar inn
+        varchar ogrn
+        varchar bank_account
         numeric rating
         enum status
-    }
-    RESTAURANT_PAYOUT {
-    uuid payout_id PK
-    uuid order_id FK
-    numeric amount
-    timestamp payout_timestamp
-    varchar transaction_id
-    enum status
+        timestamp deleted_at
     }
     COURIER {
         uuid courier_id PK
-        varchar full_name
+        varchar last_name
+        varchar first_name
+        varchar middle_name
         char phone_number
         enum status
         date hire_date
@@ -82,6 +80,7 @@ erDiagram
         enum status
         enum pay_status
         text description
+        timestamp deleted_at
     }
     PAYMENT {
         uuid payment_id PK
@@ -96,26 +95,18 @@ erDiagram
         uuid order_id PK,FK
         uuid product_id PK,FK
         numeric quantity
+        numeric price
     }
     REVIEW {
         uuid review_id PK
         timestamp review_timestamp
+        uuid entity_id
+        enum entity_type
         uuid order_id FK
         text description
         text photo_url
         numeric rating
-    }
-    PRODUCT_REVIEW {
-        uuid review_id PK, FK
-        uuid product_id FK
-    }
-    RESTAURANT_REVIEW {
-        uuid review_id PK, FK
-        uuid restaurant_id FK
-    }
-    ORDER_REVIEW {
-        uuid review_id PK, FK
-    }
+}
 
     CLIENT ||--o{ CLIENT_ADDRESS : ""
     ADDRESS ||--o{ CLIENT_ADDRESS : ""
@@ -125,14 +116,8 @@ erDiagram
     COURIER ||--o{ COURIER_PAY : ""
     CLIENT_ADDRESS ||--o{ ORDER : ""
     RESTAURANT ||--o{ ORDER : ""
-    COURIER ||--o{ ORDER : ""
+    COURIER |o--o{ ORDER : ""
     ORDER ||--o{ PAYMENT : ""
-    ORDER ||--o{ ORDER_STRUCTURE : ""
+    ORDER ||--|{ ORDER_STRUCTURE : ""
     PRODUCT ||--o{ ORDER_STRUCTURE : ""
     ORDER ||--o{ REVIEW : ""
-    REVIEW ||--|| PRODUCT_REVIEW : ""
-    PRODUCT ||--o{ PRODUCT_REVIEW : ""
-    REVIEW ||--|| RESTAURANT_REVIEW : ""
-    RESTAURANT ||--o{ RESTAURANT_REVIEW : ""
-    REVIEW ||--|| ORDER_REVIEW : ""
-    ORDER ||--o{ RESTAURANT_PAYOUT : ""
