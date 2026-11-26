@@ -1,488 +1,379 @@
 begin;
 
-drop schema if exists tst cascade;
-create schema tst;
-set local search_path to shkuratetskiy_food, exts, tst;
+set local search_path to shkuratetskiy_food, exts;
 
-create table tst.result (
-    id      int generated always as identity primary key,
-    test    text    not null,
-    ok      boolean not null,
+-- Только бизнес-логика get_statistic(). Рабочие данные не удаляются.
+create temp table statistic_test_result (
+    id int generated always as identity primary key,
+    test text not null,
+    ok boolean not null,
     details text
 );
 
-create sequence tst.seq;
+create function pg_temp.expect_true(p_test text, p_ok boolean, p_details text default null)
+returns void language sql as $$
+    insert into pg_temp.statistic_test_result(test, ok, details)
+    values (p_test, coalesce(p_ok, false),
+            case when p_ok is not true then coalesce(p_details, 'условие ложно или NULL') end);
+$$;
 
--- функция вычисляется заново при каждом обращении к представлению
-create view tst.s as
-select * from shkuratetskiy_food.get_statistic();
-
-
--- Инфраструктура
-create function tst.expect_true(p_test text, p_query text)
-returns void language plpgsql as $$
+-- Один вызов статистики на проверку. NULL в массиве аргументов не нужен:
+-- NULL вместо массива означает, что соответствующая колонка должна быть NULL.
+create function pg_temp.expect_stat(
+    p_test text, p_name text, p_products text[], p_total numeric,
+    p_avg numeric, p_users text[]
+) returns void language plpgsql as $$
 declare
-    b boolean;
+    n bigint;
+    good bigint;
+    actual jsonb;
 begin
-    execute p_query into b;
-    insert into tst.result(test, ok, details)
-    values (p_test, coalesce(b, false), case when b is true then null else 'условие ложно/NULL: ' || p_query end);
+    select count(*), count(*) filter (where
+               (case when p_products is null then s.best_product_name is null
+                     else s.best_product_name = any(p_products) end)
+               and s.total_amount is not distinct from p_total
+               and s.avg_amount is not distinct from p_avg
+               and (case when p_users is null then s.best_user is null
+                         else s.best_user = any(p_users) end)),
+           jsonb_agg(to_jsonb(s))
+    into n, good, actual
+    from shkuratetskiy_food.get_statistic() s
+    where s.restaurant_name = p_name;
+
+    perform pg_temp.expect_true(p_test, n = 1 and good = 1,
+        format('ожидалась одна строка: блюдо=%s, total=%s, avg=%s, клиент=%s; получено: %s',
+               coalesce(p_products::text, 'NULL'), coalesce(p_total::text, 'NULL'),
+               coalesce(p_avg::text, 'NULL'), coalesce(p_users::text, 'NULL'),
+               coalesce(actual::text, 'нет строк')));
 exception when others then
-    insert into tst.result(test, ok, details) values (p_test, false, sqlstate || ': ' || sqlerrm);
-end $$;
+    perform pg_temp.expect_true(p_test, false, sqlstate || ': ' || sqlerrm);
+end;
+$$;
 
-
--- запрос возвращает текст с описанием нарушений
-create function tst.expect_empty(p_test text, p_query text)
-returns void language plpgsql as $$
-declare
-    v text;
-begin
-    execute p_query into v;
-    insert into tst.result(test, ok, details)
-    values (p_test, coalesce(v, '') = '', nullif(v, ''));
-exception when others then
-    insert into tst.result(test, ok, details) values (p_test, false, sqlstate || ': ' || sqlerrm);
-end $$;
-
-
-create function tst.wipe() returns void language plpgsql as $$
-declare
-    v_tables text;
-begin
-    select string_agg(format('%I.%I', schemaname, tablename), ', ' order by tablename)
-    into v_tables
-    from pg_tables
-    where schemaname = 'shkuratetskiy_food';
-
-    if v_tables is not null then
-        execute 'truncate table ' || v_tables || ' restart identity';
-    end if;
-end $$;
-
-
--- Построители данных (order_amount и pay_status считают триггеры)
-create function tst.mk_rest(p_name text) returns uuid language plpgsql as $$
+-- Минимальные валидные фикстуры по актуальной схеме.
+create function pg_temp.mk_rest(p_name text) returns uuid language plpgsql as $$
 declare
     a uuid;
-    r uuid;
+    r uuid := uuid_generate_v4();
 begin
     insert into address(street, house_number)
-    values ('рест ' || nextval('tst.seq'), '1')
-    returning address_id into a;
+    values ('Тест статистики ' || r, '1') returning address_id into a;
 
-    insert into restaurant(restaurant_name, address_id, description, work_start, work_end, company_details, status)
-    values (p_name, a, 'д', '09:00', '22:00', 'д', 'активен')
-    returning restaurant_id into r;
-
+    insert into restaurant(restaurant_id, restaurant_name, address_id, description,
+                           work_start, work_end, inn, ogrn, bank_account, status)
+    values (r, p_name, a, 'Тест', '09:00', '22:00', '7701234567',
+            '1027700132195', '40702810900000000001', 'активен');
     return r;
-end $$;
+end;
+$$;
 
-
-create function tst.mk_client(p_login text) returns uuid language plpgsql as $$
+create function pg_temp.mk_client(p_login text) returns uuid language plpgsql as $$
 declare
     c uuid;
 begin
-    insert into client(login, password, phone_number)
-    values (p_login, md5(p_login), '+79' || lpad(nextval('tst.seq')::text, 9, '0'))
-    returning client_id into c;
-
+    loop
+        insert into client(login, password, phone_number)
+        values (p_login, md5(p_login),
+                '+79' || lpad(floor(random() * 1000000000)::bigint::text, 9, '0'))
+        on conflict (phone_number) do nothing returning client_id into c;
+        exit when c is not null;
+    end loop;
     return c;
-end $$;
+end;
+$$;
 
-
-create function tst.mk_addr(p_client uuid) returns uuid language plpgsql as $$
+create function pg_temp.mk_addr(p_client uuid) returns uuid language plpgsql as $$
 declare
-    a  uuid;
+    a uuid;
     ca uuid;
 begin
     insert into address(street, house_number)
-    values ('кл ' || nextval('tst.seq'), '1')
-    returning address_id into a;
-
+    values ('Тест статистики ' || uuid_generate_v4(), '1') returning address_id into a;
     insert into client_address(client_id, address_id)
-    values (p_client, a)
-    returning client_address_id into ca;
-
+    values (p_client, a) returning client_address_id into ca;
     return ca;
-end $$;
+end;
+$$;
 
-
-create function tst.mk_prod(p_rest uuid, p_name text, p_unit measure_unit default 'шт', p_price numeric default 1000)
+create function pg_temp.mk_prod(p_rest uuid, p_name text, p_price numeric default 1000,
+                               p_unit measure_unit default 'шт')
 returns uuid language plpgsql as $$
 declare
     cat uuid;
-    p   uuid;
+    p uuid;
 begin
-    select product_category_id into cat from product_category limit 1;
-
-    if cat is null then
-        insert into product_category(product_category_name) values ('кат') returning product_category_id into cat;
-    end if;
-
-    insert into product(product_name, product_category_id, price, restaurant_id, status, description, measure_unit)
-    values (p_name, cat, p_price, p_rest, 'доступно', 'д', p_unit)
+    insert into product_category(product_category_name)
+    values ('Тест статистики') returning product_category_id into cat;
+    insert into product(product_name, product_category_id, price, restaurant_id,
+                        status, description, measure_unit)
+    values (p_name, cat, p_price, p_rest, 'доступно', 'Тест', p_unit)
     returning product_id into p;
-
     return p;
-end $$;
+end;
+$$;
 
-
--- заказ с одной позицией
-create function tst.mk_order(p_ca uuid, p_rest uuid, p_status order_status, p_prod uuid, p_qty numeric)
+-- Позиции могут быть множественными. Оплата и сумма заказа считаются штатно.
+create function pg_temp.mk_order(p_ca uuid, p_rest uuid, p_courier uuid,
+                                p_status order_status, p_products uuid[],
+                                p_qty numeric[], p_paid boolean default false)
 returns uuid language plpgsql as $$
 declare
     o uuid;
 begin
-    insert into "order"(client_address_id, restaurant_id, status)
-    values (p_ca, p_rest, 'создан')
-    returning order_id into o;
+    insert into "order"(client_address_id, restaurant_id, courier_id, status)
+    values (p_ca, p_rest, p_courier, 'создан') returning order_id into o;
 
-    insert into order_structure(order_id, product_id, quantity) values (o, p_prod, p_qty);
+    insert into order_structure(order_id, product_id, quantity, price)
+    select o, p.product_id, u.qty, p.price
+    from unnest(p_products, p_qty) u(product_id, qty)
+    join product p on p.product_id = u.product_id;
 
-    if p_status = 'доставлен' then
-        insert into payment(order_id, payment_type, transaction_id, status)
-        values (o, 'карта', 'tx' || nextval('tst.seq'), 'успех');
-
-        update "order" set status = 'доставлен', delivery_timestamp = localtimestamp where order_id = o;
-    elsif p_status != 'создан' then
-        update "order" set status = p_status where order_id = o;
+    if p_status = 'доставлен' or p_paid then
+        insert into payment(order_id, payment_type, amount, transaction_id, status)
+        select o, 'карта', total_amount, uuid_generate_v4()::text, 'успех'
+        from "order" where order_id = o;
     end if;
 
+    if p_status <> 'создан' then
+        update "order"
+        set status = p_status,
+            delivery_timestamp = case when p_status = 'доставлен' then localtimestamp end
+        where order_id = o;
+    end if;
     return o;
-end $$;
+end;
+$$;
 
-
-create function tst.seen(p_col text, p_rest text, p_n int default 60) returns text[] language plpgsql as $$
+-- 1. Финансы, лидеры, фильтр статусов, независимость ресторанов.
+do $$
 declare
-    v   text;
-    res text[] := '{}';
-    i   int;
-begin
-    for i in 1..p_n loop
-        execute format('select %I::text from tst.s where restaurant_name = %L', p_col, p_rest) into v;
-        res := res || coalesce(v, '<null>');
-    end loop;
-
-    return array(select distinct x from unnest(res) x order by 1);
-end $$;
-
-
-do $t$
-begin
-    perform tst.expect_true('контракт: имена и порядок колонок',
-        $q$select proargnames = array['restaurant_name','best_product_name','total_amount','avg_amount','best_user']
-           from pg_proc where oid = 'shkuratetskiy_food.get_statistic()'::regprocedure$q$);
-
-    perform tst.expect_true('контракт: функция возвращает таблицу (set)',
-        $q$select proretset from pg_proc where oid = 'shkuratetskiy_food.get_statistic()'::regprocedure$q$);
-end $t$;
-
-
--- 1. Форма результата
-do $t$
-declare
-    r1 uuid; r2 uuid; c uuid; a uuid; p uuid;
-begin
-    perform tst.wipe();
-
-    r1 := tst.mk_rest('f_full');
-    r2 := tst.mk_rest('f_open');
-    perform tst.mk_rest('f_empty');
-
-    c := tst.mk_client('form_user');
-    a := tst.mk_addr(c);
-
-    p := tst.mk_prod(r1, 'form_dish');
-    perform tst.mk_order(a, r1, 'доставлен', p, 1);
-
-    p := tst.mk_prod(r2, 'open_dish');
-    perform tst.mk_order(a, r2, 'создан', p, 1);
-
-    perform tst.expect_true('форма: одна строка на каждый ресторан',
-        'select (select count(*) from tst.s) = (select count(*) from restaurant)');
-
-    perform tst.expect_true('форма: названия ресторанов не дублируются',
-        'select count(*) = count(distinct restaurant_name) from tst.s');
-
-    perform tst.expect_true('форма: ресторан с доставленным заказом заполнен целиком',
-        $q$select count(*) = 1 and bool_and(best_product_name is not null and total_amount is not null
-                                            and avg_amount is not null and best_user is not null)
-           from tst.s where restaurant_name = 'f_full'$q$);
-
-    perform tst.expect_true('форма: ресторан только с недоставленным заказом — остальные колонки NULL',
-        $q$select count(*) = 1 and bool_and(best_product_name is null and total_amount is null
-                                            and avg_amount is null and best_user is null)
-           from tst.s where restaurant_name = 'f_open'$q$);
-
-    perform tst.expect_true('форма: ресторан без заказов — остальные колонки NULL',
-        $q$select count(*) = 1 and bool_and(best_product_name is null and total_amount is null
-                                            and avg_amount is null and best_user is null)
-           from tst.s where restaurant_name = 'f_empty'$q$);
-end $t$;
-
-
--- 2. Фильтр по статусу: недоставленные заказы не влияют ни на одну колонку
-do $t$
-declare
-    r uuid; c1 uuid; c2 uuid; a1 uuid; a2 uuid; pd uuid; pn uuid;
+    prefix text := 'stat_' || replace(uuid_generate_v4()::text, '-', '');
+    n text := prefix || '_main';
+    n_other text := prefix || '_other';
+    n_empty text := prefix || '_empty';
+    n_open text := prefix || '_open';
+    r uuid; r_other uuid; r_empty uuid; r_open uuid;
+    courier uuid; c1 uuid; c2 uuid; a1 uuid; a2 uuid; a3 uuid; b uuid;
+    p1 uuid; p2 uuid; p3 uuid; pn uuid; po uuid; px uuid;
+    u1 text := prefix || '_fan';
+    u2 text := prefix || '_rich';
     st order_status;
 begin
-    perform tst.wipe();
+    insert into shkuratetskiy_food.courier(last_name, first_name, middle_name, phone_number, status)
+    values ('Тест', 'Тест', 'Тест', '+79000000000', 'свободен') returning courier_id into courier;
 
-    r  := tst.mk_rest('st');
-    c1 := tst.mk_client('delivered_user');
-    c2 := tst.mk_client('noise_user');
-    a1 := tst.mk_addr(c1);
-    a2 := tst.mk_addr(c2);
-    pd := tst.mk_prod(r, 'dish_del');
-    pn := tst.mk_prod(r, 'dish_noise');
+    r := pg_temp.mk_rest(n);
+    r_other := pg_temp.mk_rest(n_other);
+    r_empty := pg_temp.mk_rest(n_empty);
+    r_open := pg_temp.mk_rest(n_open);
+    c1 := pg_temp.mk_client(u1);
+    c2 := pg_temp.mk_client(u2);
+    a1 := pg_temp.mk_addr(c1);
+    a2 := pg_temp.mk_addr(c1);
+    a3 := pg_temp.mk_addr(c1);
+    b := pg_temp.mk_addr(c2);
+    p1 := pg_temp.mk_prod(r, 'many_orders', 2500);
+    p2 := pg_temp.mk_prod(r, 'big_qty', 1000);
+    p3 := pg_temp.mk_prod(r, 'extra', 5000);
+    pn := pg_temp.mk_prod(r, 'noise');
 
-    perform tst.mk_order(a1, r, 'доставлен', pd, 1);
+    -- Клиент 1: 3 заказа по 2750 с разных адресов (8250).
+    -- Клиент 2: 2 заказа на 7700 и 2200 (9900). Один заказ с двумя позициями.
+    -- many_orders: 3 шт. на 7500; big_qty: 4 шт. на 4000; extra: 1 шт. на 5000.
+    perform pg_temp.mk_order(a1, r, courier, 'доставлен', array[p1], array[1]::numeric[]);
+    perform pg_temp.mk_order(a2, r, courier, 'доставлен', array[p1], array[1]::numeric[]);
+    perform pg_temp.mk_order(a3, r, courier, 'доставлен', array[p1], array[1]::numeric[]);
+    perform pg_temp.mk_order(b, r, courier, 'доставлен', array[p2,p3], array[2,1]::numeric[]);
+    perform pg_temp.mk_order(b, r, courier, 'доставлен', array[p2], array[2]::numeric[]);
 
-    -- создан, готовится, в_доставке, отменён: у шума и заказов больше, и блюда больше
-    for st in select e from unnest(enum_range(null::order_status)) e where e != 'доставлен' loop
-        perform tst.mk_order(a2, r, st, pn, 5);
+    perform pg_temp.expect_stat('финансы и лидеры: 5 заказов, разные адреса, несколько позиций',
+                               n, array['big_qty'], 18150, 3630, array[u1]);
+
+    -- Все недоставленные статусы: шум мог бы победить по количеству и заказам.
+    -- Заказ в доставке уже оплачен: одного pay_status недостаточно.
+    for st in select unnest(enum_range(null::order_status)) loop
+        if st <> 'доставлен' then
+            perform pg_temp.mk_order(b, r, courier, st, array[pn], array[10]::numeric[], st = 'в_доставке');
+            perform pg_temp.expect_stat('фильтр статуса: ' || st,
+                                       n, array['big_qty'], 18150, 3630, array[u1]);
+        end if;
     end loop;
 
-    perform tst.expect_true('статус: best_product_name только по доставленным',
-        $q$select best_product_name = 'dish_del' from tst.s where restaurant_name = 'st'$q$);
+    -- Тот же клиент в другом ресторане; его заказы не смешиваются.
+    po := pg_temp.mk_prod(r_other, 'other_dish');
+    perform pg_temp.mk_order(b, r_other, courier, 'доставлен', array[po], array[10]::numeric[]);
+    perform pg_temp.expect_stat('изоляция: другой ресторан', n_other, array['other_dish'], 11000, 11000, array[u2]);
+    perform pg_temp.expect_stat('изоляция: исходный ресторан не изменился', n, array['big_qty'], 18150, 3630, array[u1]);
 
-    perform tst.expect_true('статус: best_user только по доставленным',
-        $q$select best_user = 'delivered_user' from tst.s where restaurant_name = 'st'$q$);
+    -- Цена в каталоге может измениться: статистика учитывает цену в заказе.
+    update product set price = 9000 where product_id = p1;
+    perform pg_temp.expect_stat('финансы: изменение цены в каталоге не меняет историю заказов',
+                               n, array['big_qty'], 18150, 3630, array[u1]);
 
-    perform tst.expect_true('статус: total_amount и avg_amount только по доставленным',
-        $q$select total_amount = 1100 and avg_amount = 1100 from tst.s where restaurant_name = 'st'$q$);
-end $t$;
+    px := pg_temp.mk_prod(r_open, 'open_dish');
+    perform pg_temp.mk_order(a1, r_open, courier, 'создан', array[px], array[1]::numeric[]);
+    perform pg_temp.expect_stat('ресторан только с недоставленным заказом', n_open, null, null, null, null);
+    perform pg_temp.expect_stat('ресторан без заказов', n_empty, null, null, null, null);
+exception when others then
+    perform pg_temp.expect_true('сценарий 1: ошибка подготовки или выполнения', false, sqlstate || ': ' || sqlerrm);
+end;
+$$;
 
-
--- 3. total_amount и avg_amount
-do $t$
+-- 2. Дробное количество, округление среднего чека в обе стороны.
+do $$
 declare
-    r1 uuid; r2 uuid; r3 uuid; c uuid; a uuid; p uuid;
+    prefix text := 'stat_' || replace(uuid_generate_v4()::text, '-', '');
+    n text;
+    u text := prefix || '_user';
+    r uuid; c uuid; a uuid; courier uuid; p uuid; q uuid;
 begin
-    perform tst.wipe();
+    insert into shkuratetskiy_food.courier(last_name, first_name, middle_name, phone_number, status)
+    values ('Тест', 'Тест', 'Тест', '+79000000000', 'свободен') returning courier_id into courier;
+    c := pg_temp.mk_client(u);
+    a := pg_temp.mk_addr(c);
 
-    c := tst.mk_client('sum_user');
-    a := tst.mk_addr(c);
+    n := prefix || '_fraction';
+    r := pg_temp.mk_rest(n);
+    p := pg_temp.mk_prod(r, 'piece_dish');
+    q := pg_temp.mk_prod(r, 'weight_dish', 1000, 'кг');
+    perform pg_temp.mk_order(a, r, courier, 'доставлен', array[p], array[3]::numeric[]);
+    perform pg_temp.mk_order(a, r, courier, 'доставлен', array[q], array[1.9]::numeric[]);
+    perform pg_temp.mk_order(a, r, courier, 'доставлен', array[q], array[1.9]::numeric[]);
+    -- 3.8 кг против 3 шт.; 3300 + 2090 + 2090 = 7480; avg = 2493.33.
+    perform pg_temp.expect_stat('дробное количество и округление среднего вниз',
+                               n, array['weight_dish'], 7480, 2493.33, array[u]);
 
-    -- sm: итоги 1100, 2200, 3300
-    r1 := tst.mk_rest('sm');
-    p  := tst.mk_prod(r1, 'sm_dish');
-    perform tst.mk_order(a, r1, 'доставлен', p, 1);
-    perform tst.mk_order(a, r1, 'доставлен', p, 2);
-    perform tst.mk_order(a, r1, 'доставлен', p, 3);
+    n := prefix || '_round';
+    r := pg_temp.mk_rest(n);
+    p := pg_temp.mk_prod(r, 'round_dish', 1000, 'кг');
+    perform pg_temp.mk_order(a, r, courier, 'доставлен', array[p], array[1]::numeric[]);
+    perform pg_temp.mk_order(a, r, courier, 'доставлен', array[p], array[1]::numeric[]);
+    perform pg_temp.mk_order(a, r, courier, 'доставлен', array[p], array[1.1]::numeric[]);
+    perform pg_temp.expect_stat('округление среднего вверх: 3410 / 3',
+                               n, array['round_dish'], 3410, 1136.67, array[u]);
+exception when others then
+    perform pg_temp.expect_true('сценарий 2: ошибка подготовки или выполнения', false, sqlstate || ': ' || sqlerrm);
+end;
+$$;
 
-    -- чужой ресторан с одним крупным заказом
-    r2 := tst.mk_rest('other');
-    p  := tst.mk_prod(r2, 'other_dish');
-    perform tst.mk_order(a, r2, 'доставлен', p, 10);
-
-    -- rnd: итоги 1100, 1100, 1210 -> avg 1136.666... (ожидается округление до 2 знаков)
-    r3 := tst.mk_rest('rnd');
-    p  := tst.mk_prod(r3, 'rnd_dish', 'кг');
-    perform tst.mk_order(a, r3, 'доставлен', p, 1);
-    perform tst.mk_order(a, r3, 'доставлен', p, 1);
-    perform tst.mk_order(a, r3, 'доставлен', p, 1.1);
-
-    perform tst.expect_true('суммы: total и avg по ресторану',
-        $q$select total_amount = 6600 and avg_amount = 2200 from tst.s where restaurant_name = 'sm'$q$);
-
-    perform tst.expect_true('суммы: заказы разных ресторанов не смешиваются',
-        $q$select total_amount = 11000 and avg_amount = 11000 from tst.s where restaurant_name = 'other'$q$);
-
-    perform tst.expect_true('суммы: avg округляется до 2 знаков',
-        $q$select total_amount = 3410 and avg_amount = 1136.67 from tst.s where restaurant_name = 'rnd'$q$);
-
-    perform tst.expect_empty('суммы: total_amount >= avg_amount везде',
-        $q$select string_agg(restaurant_name, ', ') from tst.s where total_amount < avg_amount$q$);
-end $t$;
-
-
--- 4. best_product_name
-do $t$
+-- 3. Ничья: только кандидаты с максимумом, ровно одна строка на вызов.
+-- Не требуем выпадения всех вариантов за конечное число вызовов.
+do $$
 declare
-    r1 uuid; r2 uuid; r3 uuid; c uuid; a uuid; p1 uuid; p2 uuid; p3 uuid;
+    prefix text := 'stat_' || replace(uuid_generate_v4()::text, '-', '');
+    n text := prefix || '_tie';
+    u1 text := prefix || '_a'; u2 text := prefix || '_b'; u3 text := prefix || '_c';
+    r uuid; courier uuid; a uuid; b uuid; c uuid; p1 uuid; p2 uuid; p3 uuid;
+    i int;
+    actual record;
+    valid boolean := true;
+    seen_products text[] := '{}'; seen_users text[] := '{}';
+    bad text;
 begin
-    perform tst.wipe();
+    insert into shkuratetskiy_food.courier(last_name, first_name, middle_name, phone_number, status)
+    values ('Тест', 'Тест', 'Тест', '+79000000000', 'свободен') returning courier_id into courier;
+    r := pg_temp.mk_rest(n);
+    a := pg_temp.mk_addr(pg_temp.mk_client(u1));
+    b := pg_temp.mk_addr(pg_temp.mk_client(u2));
+    c := pg_temp.mk_addr(pg_temp.mk_client(u3));
+    p1 := pg_temp.mk_prod(r, 'tie_a');
+    p2 := pg_temp.mk_prod(r, 'tie_b');
+    p3 := pg_temp.mk_prod(r, 'not_leader');
+    perform pg_temp.mk_order(a, r, courier, 'доставлен', array[p1], array[1]::numeric[]);
+    perform pg_temp.mk_order(a, r, courier, 'доставлен', array[p1], array[1]::numeric[]);
+    perform pg_temp.mk_order(b, r, courier, 'доставлен', array[p2], array[1]::numeric[]);
+    perform pg_temp.mk_order(b, r, courier, 'доставлен', array[p2], array[1]::numeric[]);
+    perform pg_temp.mk_order(c, r, courier, 'доставлен', array[p3], array[1]::numeric[]);
 
-    c := tst.mk_client('prod_user');
-    a := tst.mk_addr(c);
+    for i in 1..20 loop
+        select count(*) as n,
+               count(*) filter (where s.best_product_name in ('tie_a', 'tie_b')
+                                  and s.best_user in (u1, u2)
+                                  and s.total_amount = 5500 and s.avg_amount = 1100) as good,
+               min(s.best_product_name) as product_name, min(s.best_user) as login,
+               jsonb_agg(to_jsonb(s)) as rows
+        into actual
+        from shkuratetskiy_food.get_statistic() s where s.restaurant_name = n;
+        if actual.n <> 1 or actual.good <> 1 then
+            valid := false;
+            bad := format('вызов %s: %s', i, coalesce(actual.rows::text, 'нет строк'));
+            exit;
+        end if;
+        if not (actual.product_name = any(seen_products)) then
+            seen_products := array_append(seen_products, actual.product_name::text);
+        end if;
+        if not (actual.login = any(seen_users)) then
+            seen_users := array_append(seen_users, actual.login::text);
+        end if;
+    end loop;
+    perform pg_temp.expect_true('ничья: 20 вызовов, одна строка, только лидеры, финансы неизменны', valid, bad);
+    raise notice 'Ничья (диагностика, не критерий успеха): блюда %, клиенты %', seen_products, seen_users;
+exception when others then
+    perform pg_temp.expect_true('сценарий 3: ошибка подготовки или выполнения', false, sqlstate || ': ' || sqlerrm);
+end;
+$$;
 
-    -- победа по SUM(quantity), а не по числу заказов: 3 заказа по 1 шт. против одного на 5 шт.
-    r1 := tst.mk_rest('bp');
-    p1 := tst.mk_prod(r1, 'many_orders');
-    p2 := tst.mk_prod(r1, 'big_qty');
-    perform tst.mk_order(a, r1, 'доставлен', p1, 1);
-    perform tst.mk_order(a, r1, 'доставлен', p1, 1);
-    perform tst.mk_order(a, r1, 'доставлен', p1, 1);
-    perform tst.mk_order(a, r1, 'доставлен', p2, 5);
-
-    -- дробное количество суммируется без округления: 1.9 + 1.9 = 3.8 против 3
-    r2 := tst.mk_rest('fr');
-    p1 := tst.mk_prod(r2, 'int_dish');
-    p2 := tst.mk_prod(r2, 'kg_dish', 'кг');
-    perform tst.mk_order(a, r2, 'доставлен', p1, 3);
-    perform tst.mk_order(a, r2, 'доставлен', p2, 1.9);
-    perform tst.mk_order(a, r2, 'доставлен', p2, 1.9);
-
-    -- равенство: два лидера по 2 шт., третье блюдо слабее
-    r3 := tst.mk_rest('tp');
-    p1 := tst.mk_prod(r3, 'tie_a');
-    p2 := tst.mk_prod(r3, 'tie_b');
-    p3 := tst.mk_prod(r3, 'low');
-    perform tst.mk_order(a, r3, 'доставлен', p1, 2);
-    perform tst.mk_order(a, r3, 'доставлен', p2, 2);
-    perform tst.mk_order(a, r3, 'доставлен', p3, 1);
-
-    perform tst.expect_true('блюдо: победа по сумме количества, а не по числу заказов',
-        $q$select best_product_name = 'big_qty' from tst.s where restaurant_name = 'bp'$q$);
-
-    perform tst.expect_true('блюдо: дробное количество (кг) суммируется корректно',
-        $q$select best_product_name = 'kg_dish' from tst.s where restaurant_name = 'fr'$q$);
-
-    perform tst.expect_true('блюдо: при равенстве ровно одна строка',
-        $q$select count(*) = 1 from tst.s where restaurant_name = 'tp'$q$);
-
-    perform tst.expect_true('блюдо: при равенстве выбор только из лидеров и выпадают оба',
-        $q$select tst.seen('best_product_name', 'tp') = array['tie_a', 'tie_b']$q$);
-end $t$;
-
-
--- 5. best_user
-do $t$
+-- 4. Названия ресторанов не уникальны: нельзя группировать по имени.
+do $$
 declare
-    r1 uuid; r2 uuid; p uuid; cf uuid; ro uuid; tx uuid; ty uuid;
-    a1 uuid; a2 uuid; a3 uuid; ra uuid; xa uuid; ya uuid;
+    prefix text := 'stat_' || replace(uuid_generate_v4()::text, '-', '');
+    n text := prefix || '_same';
+    u text := prefix || '_user';
+    r1 uuid; r2 uuid; p uuid; a uuid; courier uuid;
+    actual record;
 begin
-    perform tst.wipe();
+    insert into shkuratetskiy_food.courier(last_name, first_name, middle_name, phone_number, status)
+    values ('Тест', 'Тест', 'Тест', '+79000000000', 'свободен') returning courier_id into courier;
+    r1 := pg_temp.mk_rest(n);
+    r2 := pg_temp.mk_rest(n);
+    a := pg_temp.mk_addr(pg_temp.mk_client(u));
+    p := pg_temp.mk_prod(r1, 'same_name_a');
+    perform pg_temp.mk_order(a, r1, courier, 'доставлен', array[p], array[1]::numeric[]);
+    p := pg_temp.mk_prod(r2, 'same_name_b');
+    perform pg_temp.mk_order(a, r2, courier, 'доставлен', array[p], array[3]::numeric[]);
 
-    -- cheap_fan: 3 дешёвых заказа с трёх разных адресов; rich_one: 2 дорогих с одного.
-    -- Группировка по адресу или по сумме дала бы rich_one.
-    r1 := tst.mk_rest('bu');
-    p  := tst.mk_prod(r1, 'bu_dish');
-    cf := tst.mk_client('cheap_fan');
-    ro := tst.mk_client('rich_one');
-    a1 := tst.mk_addr(cf);
-    a2 := tst.mk_addr(cf);
-    a3 := tst.mk_addr(cf);
-    ra := tst.mk_addr(ro);
+    select count(*) as n,
+           count(*) filter (where best_product_name = 'same_name_a' and total_amount = 1100
+                            and avg_amount = 1100 and best_user = u) as a_count,
+           count(*) filter (where best_product_name = 'same_name_b' and total_amount = 3300
+                            and avg_amount = 3300 and best_user = u) as b_count,
+           jsonb_agg(to_jsonb(s)) as rows
+    into actual
+    from shkuratetskiy_food.get_statistic() s where s.restaurant_name = n;
+    perform pg_temp.expect_true('одинаковые названия: две независимые строки',
+                               actual.n = 2 and actual.a_count = 1 and actual.b_count = 1,
+                               coalesce(actual.rows::text, 'нет строк'));
+exception when others then
+    perform pg_temp.expect_true('сценарий 4: ошибка подготовки или выполнения', false, sqlstate || ': ' || sqlerrm);
+end;
+$$;
 
-    perform tst.mk_order(a1, r1, 'доставлен', p, 1);
-    perform tst.mk_order(a2, r1, 'доставлен', p, 1);
-    perform tst.mk_order(a3, r1, 'доставлен', p, 1);
-    perform tst.mk_order(ra, r1, 'доставлен', p, 50);
-    perform tst.mk_order(ra, r1, 'доставлен', p, 50);
-
-    -- равенство: по 2 заказа
-    r2 := tst.mk_rest('tu');
-    p  := tst.mk_prod(r2, 'tu_dish');
-    tx := tst.mk_client('tie_x');
-    ty := tst.mk_client('tie_y');
-    xa := tst.mk_addr(tx);
-    ya := tst.mk_addr(ty);
-
-    perform tst.mk_order(xa, r2, 'доставлен', p, 1);
-    perform tst.mk_order(xa, r2, 'доставлен', p, 1);
-    perform tst.mk_order(ya, r2, 'доставлен', p, 1);
-    perform tst.mk_order(ya, r2, 'доставлен', p, 1);
-
-    perform tst.expect_true('клиент: победа по числу заказов, а не по сумме; адреса клиента объединяются',
-        $q$select best_user = 'cheap_fan' from tst.s where restaurant_name = 'bu'$q$);
-
-    perform tst.expect_true('клиент: при равенстве ровно одна строка',
-        $q$select count(*) = 1 from tst.s where restaurant_name = 'tu'$q$);
-
-    perform tst.expect_true('клиент: при равенстве выбор только из лидеров и выпадают оба',
-        $q$select tst.seen('best_user', 'tu') = array['tie_x', 'tie_y']$q$);
-end $t$;
-
-
--- 6. Заказы без клиента (client удалён -> client_address.client_id = NULL)
-do $t$
-declare
-    r1 uuid; r2 uuid; p uuid; gone uuid; stay uuid; ga uuid; sa uuid;
+-- 5. Кардинальность результата по всей схеме (включая существующие данные).
+do $$
 begin
-    perform tst.wipe();
+    perform pg_temp.expect_true('одна строка на каждый ресторан (по названиям с учётом повторов)',
+        not exists (
+            select restaurant_name
+            from (
+                select restaurant_name, 1 as delta from restaurant
+                union all
+                select restaurant_name, -1 from shkuratetskiy_food.get_statistic()
+            ) x
+            group by restaurant_name
+            having sum(delta) <> 0
+        ));
+exception when others then
+    perform pg_temp.expect_true('одна строка на каждый ресторан', false, sqlstate || ': ' || sqlerrm);
+end;
+$$;
 
-    -- у ушедшего клиента заказов больше, но он не может быть best_user
-    r1   := tst.mk_rest('nc1');
-    p    := tst.mk_prod(r1, 'nc1_dish');
-    gone := tst.mk_client('gone_big');
-    stay := tst.mk_client('stays');
-    ga   := tst.mk_addr(gone);
-    sa   := tst.mk_addr(stay);
-
-    perform tst.mk_order(ga, r1, 'доставлен', p, 1);
-    perform tst.mk_order(ga, r1, 'доставлен', p, 1);
-    perform tst.mk_order(ga, r1, 'доставлен', p, 1);
-    perform tst.mk_order(sa, r1, 'доставлен', p, 1);
-
-    -- все доставленные заказы без клиента
-    r2 := tst.mk_rest('nc2');
-    p  := tst.mk_prod(r2, 'nc2_dish');
-    ga := tst.mk_addr(tst.mk_client('gone_only'));
-
-    perform tst.mk_order(ga, r2, 'доставлен', p, 1);
-    perform tst.mk_order(ga, r2, 'доставлен', p, 1);
-
-    delete from client where login in ('gone_big', 'gone_only');
-
-    perform tst.expect_true('без клиента: заказ входит в total_amount и avg_amount',
-        $q$select total_amount = 4400 and avg_amount = 1100 from tst.s where restaurant_name = 'nc1'$q$);
-
-    perform tst.expect_true('без клиента: заказ не участвует в выборе best_user',
-        $q$select best_user = 'stays' from tst.s where restaurant_name = 'nc1'$q$);
-
-    perform tst.expect_true('без клиента: все заказы без клиента -> best_user NULL, остальное заполнено',
-        $q$select count(*) = 1 and bool_and(best_user is null and best_product_name = 'nc2_dish'
-                                            and total_amount = 2200 and avg_amount = 1100)
-           from tst.s where restaurant_name = 'nc2'$q$);
-end $t$;
-
-
--- 7. Заказ без ресторана
--- Триггеры-защитники не дают обнулить ресторан напрямую, поэтому на время апдейта отключаем их
-do $t$
-declare
-    r uuid; c uuid; a uuid; p uuid; o uuid;
-begin
-    perform tst.wipe();
-
-    r := tst.mk_rest('nr');
-    c := tst.mk_client('nr_user');
-    a := tst.mk_addr(c);
-    p := tst.mk_prod(r, 'nr_dish');
-
-    perform tst.mk_order(a, r, 'доставлен', p, 1);
-    o := tst.mk_order(a, r, 'доставлен', p, 50);
-
-    alter table "order" disable trigger trg_order_parties_guard;
-    alter table "order" disable trigger trg_order_restaurant_guard;
-    update "order" set restaurant_id = null where order_id = o;
-    alter table "order" enable trigger trg_order_parties_guard;
-    alter table "order" enable trigger trg_order_restaurant_guard;
-
-    perform tst.expect_true('без ресторана: заказ не попадает ни в один ресторан и не ломает функцию',
-        $q$select count(*) = 1 and bool_and(total_amount = 1100 and avg_amount = 1100)
-           from tst.s where restaurant_name = 'nr'$q$);
-
-    perform tst.expect_true('без ресторана: нет лишних строк, одна на ресторан',
-        'select (select count(*) from tst.s) = (select count(*) from restaurant)');
-
-    perform tst.expect_true('без ресторана: нет строки с NULL в restaurant_name',
-        'select not exists (select 1 from tst.s where restaurant_name is null)');
-end $t$;
-
-
--- Итог
 select count(*) filter (where ok) as passed,
        count(*) filter (where not ok) as failed,
        count(*) as total
-from tst.result;
+from pg_temp.statistic_test_result;
 
 select id, test, details
-from tst.result
+from pg_temp.statistic_test_result
 where not ok
 order by id;
 

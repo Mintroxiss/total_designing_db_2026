@@ -2,90 +2,93 @@ begin;
 
 set local search_path to shkuratetskiy_food, exts;
 
-create or replace function refresh_product_rating(p_id uuid)
-returns void
-language plpgsql
-set search_path = shkuratetskiy_food
-as $$
-begin
-    perform 1 from product where product_id = p_id for update;
-
-    update product p
-       set rating = (select round(avg(r.rating), 2)
-                     from product_review pr
-                     join review r using (review_id)
-                     where pr.product_id = p_id)
-     where p.product_id = p_id;
-end;
-$$;
-
-create or replace function refresh_restaurant_rating(r_id uuid)
-returns void
-language plpgsql
-set search_path = shkuratetskiy_food
-as $$
-begin
-    perform 1 from restaurant where restaurant_id = r_id for update;
-
-    update restaurant s
-       set rating = (select round(avg(r.rating), 2)
-                     from restaurant_review rr
-                     join review r using (review_id)
-                     where rr.restaurant_id = r_id)
-    where s.restaurant_id = r_id;
-end;
-$$;
-
+-- Автоматический пересчёт агрегированного рейтинга
+-- блюда или ресторана при изменении отзывов
 create or replace function rating_change()
 returns trigger
 language plpgsql
-set search_path = shkuratetskiy_food
 as $$
 declare
-    ids uuid[] := '{}';
-    x   uuid;
+    v_old_entity_type shkuratetskiy_food.entity_type;
+    v_old_entity_id   uuid;
+    v_new_entity_type shkuratetskiy_food.entity_type;
+    v_new_entity_id   uuid;
+    v_entity_type     shkuratetskiy_food.entity_type;
+    v_entity_id       uuid;
 begin
-    if tg_table_name = 'product_review' then
-        if tg_op in ('UPDATE', 'DELETE') then ids := ids || old.product_id; end if;
-        if tg_op in ('INSERT', 'UPDATE') then ids := ids || new.product_id; end if;
+    -- Определение затронутых сущностей
+    case tg_op
+        when 'INSERT' then
+            v_new_entity_type := new.entity_type;
+            v_new_entity_id   := new.entity_id;
 
-        for x in select distinct u from unnest(ids) u order by u loop
-            perform refresh_product_rating(x);
-        end loop;
+        when 'UPDATE' then
+            v_old_entity_type := old.entity_type;
+            v_old_entity_id   := old.entity_id;
+            v_new_entity_type := new.entity_type;
+            v_new_entity_id   := new.entity_id;
 
-    elsif tg_table_name = 'restaurant_review' then
-        if tg_op in ('UPDATE', 'DELETE') then ids := ids || old.restaurant_id; end if;
-        if tg_op in ('INSERT', 'UPDATE') then ids := ids || new.restaurant_id; end if;
+        when 'DELETE' then
+            v_old_entity_type := old.entity_type;
+            v_old_entity_id   := old.entity_id;
+    end case;
 
-        for x in select distinct u from unnest(ids) u order by u loop
-            perform refresh_restaurant_rating(x);
-        end loop;
+    -- Пересчёт рейтингов уникальных затронутых сущностей
+    for v_entity_type, v_entity_id in
+        select distinct e.entity_type, e.entity_id
+        from (
+            values
+                (v_old_entity_type, v_old_entity_id),
+                (v_new_entity_type, v_new_entity_id)
+        ) as e(entity_type, entity_id)
+        where e.entity_type in ('блюдо', 'ресторан')
+        order by e.entity_type, e.entity_id
+    loop
+        case v_entity_type
 
-    elsif tg_table_name = 'review' then
-        for x in select product_id from product_review where review_id = new.review_id loop
-            perform refresh_product_rating(x);
-        end loop;
-        for x in select restaurant_id from restaurant_review where review_id = new.review_id loop
-            perform refresh_restaurant_rating(x);
-        end loop;
-    end if;
+            when 'блюдо' then
+
+                perform 1
+                from shkuratetskiy_food.product
+                where product_id = v_entity_id
+                for no key update;
+
+                update shkuratetskiy_food.product
+                set rating = (
+                    select round(avg(rating), 2)
+                    from shkuratetskiy_food.review
+                    where entity_type = 'блюдо'
+                      and entity_id = v_entity_id
+                )
+                where product_id = v_entity_id;
+
+            when 'ресторан' then
+
+                perform 1
+                from shkuratetskiy_food.restaurant
+                where restaurant_id = v_entity_id
+                for no key update;
+
+                update shkuratetskiy_food.restaurant
+                set rating = (
+                    select round(avg(rating), 2)
+                    from shkuratetskiy_food.review
+                    where entity_type = 'ресторан'
+                      and entity_id = v_entity_id
+                )
+                where restaurant_id = v_entity_id;
+
+        end case;
+    end loop;
 
     return null;
 end;
 $$;
 
-create or replace trigger trg_product_review_rating
-    after insert or update of product_id, review_id or delete on product_review
-    for each row execute function rating_change();
-
-create or replace trigger trg_restaurant_review_rating
-    after insert or update of restaurant_id, review_id or delete on restaurant_review
-    for each row execute function rating_change();
-
 create or replace trigger trg_review_rating
-    after update of rating on review
+    after insert or update or delete
+    on review
     for each row
-    when (new.rating is distinct from old.rating)
     execute function rating_change();
 
 commit;

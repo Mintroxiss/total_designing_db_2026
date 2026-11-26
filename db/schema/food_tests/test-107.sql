@@ -66,8 +66,8 @@ begin
     values ('рест ' || nextval('tst.seq'), '1')
     returning address_id into a;
 
-    insert into restaurant(restaurant_name, address_id, description, work_start, work_end, company_details, status)
-    values (p_name, a, 'д', '09:00', '22:00', 'д', 'активен')
+    insert into restaurant(restaurant_name, address_id, description, work_start, work_end, inn, ogrn, bank_account, status)
+    values (p_name, a, 'д', '09:00', '22:00', '1234567890', '1234567890123', '12345678901234567890', 'активен')
     returning restaurant_id into r;
 
     return r;
@@ -123,23 +123,30 @@ begin
 end $$;
 
 
--- заказ с одной позицией; доставленный проходит весь путь
-create function tst.mk_order(p_ca uuid, p_rest uuid, p_status order_status, p_prod uuid, p_qty numeric)
+-- заказ с одной позицией; курьер назначается до смены статуса
+create function tst.mk_order(p_ca uuid, p_rest uuid, p_status order_status,
+                             p_prod uuid, p_qty numeric, p_courier uuid, p_ts timestamp)
 returns uuid language plpgsql as $$
 declare
     o uuid;
 begin
-    insert into "order"(client_address_id, restaurant_id, status)
-    values (p_ca, p_rest, 'создан')
+    insert into "order"(client_address_id, restaurant_id, courier_id, order_timestamp, status)
+    values (p_ca, p_rest, p_courier,
+            case when p_status = 'доставлен' then p_ts - interval '1 minute'
+                 else localtimestamp end,
+            'создан')
     returning order_id into o;
 
-    insert into order_structure(order_id, product_id, quantity) values (o, p_prod, p_qty);
+    insert into order_structure(order_id, product_id, quantity, price)
+    select o, p_prod, p_qty, p.price
+    from product p where p.product_id = p_prod;
 
     if p_status = 'доставлен' then
-        insert into payment(order_id, payment_type, transaction_id, status)
-        values (o, 'карта', 'tx' || nextval('tst.seq'), 'успех');
+        insert into payment(order_id, payment_type, amount, transaction_id, status)
+        select o, 'карта', ord.total_amount, 'tx' || nextval('tst.seq'), 'успех'
+        from "order" ord where ord.order_id = o;
 
-        update "order" set status = 'доставлен', delivery_timestamp = localtimestamp where order_id = o;
+        update "order" set status = 'доставлен', delivery_timestamp = p_ts where order_id = o;
     elsif p_status != 'создан' then
         update "order" set status = p_status where order_id = o;
     end if;
@@ -168,8 +175,8 @@ create function tst.mk_courier(p_coef numeric default 0.1) returns uuid language
 declare
     c uuid;
 begin
-    insert into courier(full_name, phone_number, status, hire_date, coefficient)
-    values ('курьер ' || nextval('tst.seq'), '+79' || lpad(nextval('tst.seq')::text, 9, '0'),
+    insert into courier(last_name, first_name, middle_name, phone_number, status, hire_date, coefficient)
+    values ('Курьер ' || nextval('tst.seq'), 'Иван', 'Иванович', '+79' || lpad(nextval('tst.seq')::text, 9, '0'),
             'свободен', current_date - 90, p_coef)
     returning courier_id into c;
 
@@ -190,45 +197,24 @@ create function tst.mk_assigned(p_courier uuid, p_status order_status, p_ts time
 returns uuid language plpgsql as $$
 declare
     x  record;
-    o  uuid;
     ts timestamp := coalesce(p_ts, date_trunc('month', localtimestamp) + interval '1 hour');
 begin
     select * into x from tst.ctx;
 
-    o := tst.mk_order(x.ca, x.rest, p_status, coalesce(p_prod, x.prod), p_qty);
-
-    update "order" set courier_id = p_courier where order_id = o;
-
-    if p_status = 'доставлен' then
-        update "order"
-           set order_timestamp = ts - interval '1 minute', delivery_timestamp = ts
-         where order_id = o;
-    end if;
-
-    return o;
+    return tst.mk_order(x.ca, x.rest, p_status, coalesce(p_prod, x.prod), p_qty, p_courier, ts);
 end $$;
 
 
 -- p_n доставленных заказов в текущем месяце, комиссия каждого = 100.00.
 create function tst.mk_deliv(p_courier uuid, p_n int, p_ts timestamp default null) returns void language plpgsql as $$
-declare
-    x  record;
-    ts timestamp := coalesce(p_ts, date_trunc('month', localtimestamp) + interval '1 hour');
 begin
     if p_n <= 0 then
         return;
     end if;
 
-    select * into x from tst.ctx;
-
-    alter table "order" disable trigger user;
-
-    insert into "order"(courier_id, client_address_id, restaurant_id, order_timestamp, delivery_timestamp,
-                        order_amount, status, pay_status)
-    select p_courier, x.ca, x.rest, ts - interval '1 minute', ts, 1000, 'доставлен', 'оплачен'
-    from generate_series(1, p_n);
-
-    alter table "order" enable trigger user;
+    for i in 1..p_n loop
+        perform tst.mk_assigned(p_courier, 'доставлен', p_ts);
+    end loop;
 end $$;
 
 
@@ -314,7 +300,7 @@ begin
     select extract(year from d)::int, extract(month from d)::int, c1, 777, 0.2
     from (select date_trunc('month', localtimestamp) - interval '1 month' as d) x;
 
-    select md5((full_name, phone_number, status, hire_date, dismissal_date)::text) into h
+    select md5((last_name, first_name, middle_name, phone_number, status, hire_date, dismissal_date)::text) into h
     from courier where courier_id = c1;
 
     perform tst.salary('зарплата: вызов без исключений');
@@ -338,7 +324,7 @@ begin
         format('select count(*) = 3 from courier where coefficient = 0.1 and courier_id in (%L, %L, %L)', c1, c2, c3));
 
     perform tst.expect_true('коэффициент: остальные колонки курьера не изменились',
-        format('select md5((full_name, phone_number, status, hire_date, dismissal_date)::text) = %L from courier where courier_id = %L', h, c1));
+        format('select md5((last_name, first_name, middle_name, phone_number, status, hire_date, dismissal_date)::text) = %L from courier where courier_id = %L', h, c1));
 end $t$;
 
 

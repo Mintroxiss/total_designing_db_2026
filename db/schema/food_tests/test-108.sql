@@ -1,3 +1,4 @@
+-- Актуальная схема shkuratetskiy_food. Запускать весь скрипт в тестовой БД.
 begin;
 
 drop schema if exists tst cascade;
@@ -13,8 +14,8 @@ create table tst.result (
 
 create sequence tst.seq;
 
--- общие объекты сценария: адрес клиента и ресторан
-create table tst.ctx (ca uuid, rest uuid);
+-- общие объекты сценария: адрес клиента, ресторан, блюдо и курьер
+create table tst.ctx (ca uuid, rest uuid, prod uuid, courier uuid);
 
 
 -- Инфраструктура
@@ -56,8 +57,8 @@ begin
     values ('рест ' || nextval('tst.seq'), '1')
     returning address_id into a;
 
-    insert into restaurant(restaurant_name, address_id, description, work_start, work_end, company_details, status)
-    values (p_name, a, 'д', '09:00', '22:00', 'д', 'активен')
+    insert into restaurant(restaurant_name, address_id, description, work_start, work_end, inn, ogrn, bank_account, status)
+    values (p_name, a, 'д', '09:00', '22:00', '1234567890', '1234567890123', '12345678901234567890', 'активен')
     returning restaurant_id into r;
 
     return r;
@@ -97,8 +98,9 @@ create function tst.mk_courier() returns uuid language plpgsql as $$
 declare
     c uuid;
 begin
-    insert into courier(full_name, phone_number, status, hire_date)
-    values ('курьер ' || nextval('tst.seq'), '+79' || lpad(nextval('tst.seq')::text, 9, '0'), 'свободен', '2025-01-01')
+    insert into courier(last_name, first_name, middle_name, phone_number, status, hire_date)
+    values ('Курьер ' || nextval('tst.seq'), 'Иван', 'Иванович',
+            '+79' || lpad(nextval('tst.seq')::text, 9, '0'), 'свободен', '2025-01-01')
     returning courier_id into c;
 
     return c;
@@ -110,49 +112,80 @@ create function tst.setup() returns void language plpgsql as $$
 declare
     r uuid;
     a uuid;
+    cat uuid;
+    p uuid;
+    c uuid;
 begin
     perform tst.wipe();
     delete from tst.ctx;
 
     r := tst.mk_rest('r');
     a := tst.mk_addr(tst.mk_client('rep_user'));
+    c := tst.mk_courier();
 
-    insert into tst.ctx values (a, r);
+    insert into product_category(product_category_name)
+    values ('категория') returning product_category_id into cat;
+
+    insert into product(product_name, product_category_id, price, restaurant_id,
+                        status, description, measure_unit)
+    values ('блюдо', cat, 1000, r, 'доступно', 'д', 'шт')
+    returning product_id into p;
+
+    insert into tst.ctx values (a, r, p, c);
 end $$;
 
 
--- Заказы вставляются прямо в "order" с явным order_amount (итог = amount * 1.1, должен быть >= 1000),
--- пользовательские триггеры на время вставки отключаются
-create function tst.mk_deliv(p_ts timestamp, p_amount numeric default 1000, p_created timestamp default null)
+-- Создаём заказ с назначенным курьером и одной позицией.
+-- Цена позиции фиксирует стоимость заказа; суммы вычисляют триггеры.
+create function tst.mk_order(p_status order_status, p_ts timestamp,
+                             p_amount numeric, p_created timestamp default null)
 returns void language plpgsql as $$
 declare
     x record;
+    o uuid;
 begin
-    select * into x from tst.ctx;
+    select * into strict x from tst.ctx;
 
-    alter table "order" disable trigger user;
+    update product set price = p_amount where product_id = x.prod;
 
-    insert into "order"(client_address_id, restaurant_id, order_timestamp, delivery_timestamp,
-                        order_amount, status, pay_status)
-    values (x.ca, x.rest, coalesce(p_created, p_ts - interval '1 minute'), p_ts, p_amount, 'доставлен', 'оплачен');
+    insert into "order"(courier_id, client_address_id, restaurant_id,
+                        order_timestamp, status)
+    values (x.courier, x.ca, x.rest,
+            coalesce(p_created, case when p_status = 'доставлен'
+                                    then p_ts - interval '1 minute'
+                                    else p_ts end), 'создан')
+    returning order_id into o;
 
-    alter table "order" enable trigger user;
+    insert into order_structure(order_id, product_id, quantity, price)
+    select o, product_id, 1, price from product where product_id = x.prod;
+
+    if p_status = 'доставлен' then
+        insert into payment(order_id, payment_type, amount, transaction_id,
+                            transaction_timestamp, status)
+        select order_id, 'карта', total_amount, 'rep-tx-' || nextval('tst.seq'),
+               p_ts, 'успех'
+        from "order" where order_id = o;
+
+        update "order"
+           set status = 'доставлен', delivery_timestamp = p_ts
+         where order_id = o;
+    elsif p_status != 'создан' then
+        update "order" set status = p_status where order_id = o;
+    end if;
+end $$;
+
+
+create function tst.mk_deliv(p_ts timestamp, p_amount numeric default 1000, p_created timestamp default null)
+returns void language plpgsql as $$
+begin
+    perform tst.mk_order('доставлен', p_ts, p_amount, p_created);
 end $$;
 
 
 create function tst.mk_other(p_status order_status, p_ts timestamp, p_amount numeric default 5000)
 returns void language plpgsql as $$
-declare
-    x record;
 begin
-    select * into x from tst.ctx;
-
-    alter table "order" disable trigger user;
-
-    insert into "order"(client_address_id, restaurant_id, order_timestamp, order_amount, status, pay_status)
-    values (x.ca, x.rest, p_ts, p_amount, p_status, 'ожидает');
-
-    alter table "order" enable trigger user;
+    perform tst.mk_order(p_status, p_ts, p_amount);
 end $$;
 
 

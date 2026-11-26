@@ -3,13 +3,14 @@ language plpgsql
 set search_path = shkuratetskiy_food, exts
 as $$
 begin
-    delete from review; -- подтипы отзывов уходят каскадом
+    delete from review;
 
+    -- Отмена заказов для корректного удаления оплат и позиций
     update "order"
-       set status = 'создан', delivery_timestamp = null
-     where status != 'создан';
+       set status = 'отменён',
+           delivery_timestamp = null
+     where status != 'отменён';
 
-    delete from restaurant_payout;
     delete from payment;
     delete from order_structure;
     delete from "order";

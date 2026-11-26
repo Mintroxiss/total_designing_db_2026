@@ -10,48 +10,120 @@ language sql
 volatile
 set search_path = shkuratetskiy_food
 as $$
-    with d as materialized (
+    -- Доставленные заказы: однократное чтение таблицы order
+    with delivered_orders as materialized (
         select o.order_id,
                o.restaurant_id,
-               o.total_amount,
-               c.login
+               o.client_address_id,
+               o.total_amount
         from "order" o
-        left join client_address ca on ca.client_address_id = o.client_address_id
-        left join client c          on c.client_id = ca.client_id
         where o.status = 'доставлен'
-          and o.restaurant_id is not null
     ),
-    totals as (
-        select restaurant_id,
-               sum(total_amount)           as total_amount,
-               round(avg(total_amount), 2) as avg_amount
-        from d
-        group by restaurant_id
+
+    -- Количество и сумма заказов каждого клиента
+    client_stats as (
+        select d.restaurant_id,
+               ca.client_id,
+               count(*) as order_count,
+               sum(d.total_amount) as order_sum
+        from delivered_orders d
+        join client_address ca
+            on ca.client_address_id = d.client_address_id
+        group by d.restaurant_id, ca.client_id
     ),
-    bu as (
-        select distinct on (restaurant_id)
-               restaurant_id, login
-        from d
-        where login is not null
-        group by restaurant_id, login
-        order by restaurant_id, count(*) desc, random()
+
+    -- Определение максимального количества заказов
+    client_max as (
+        select cs.*,
+               max(cs.order_count) over (
+                   partition by cs.restaurant_id
+               ) as max_order_count
+        from client_stats cs
     ),
-    bp as (
-        select distinct on (d.restaurant_id)
-               d.restaurant_id, p.product_name
-        from d
-        join order_structure os on os.order_id = d.order_id
-        join product p          on p.product_id = os.product_id
-        group by d.restaurant_id, p.product_id, p.product_name
-        order by d.restaurant_id, sum(os.quantity) desc, random()
+
+    -- Финансовая статистика и кандидаты на лучшего клиента
+    restaurant_stats as (
+        select cm.restaurant_id,
+               sum(cm.order_sum) as total_amount,
+               round(
+                   sum(cm.order_sum) / sum(cm.order_count), 2
+               ) as avg_amount,
+               array_agg(cm.client_id) filter (
+                   where cm.order_count = cm.max_order_count
+               ) as best_client_ids
+        from client_max cm
+        group by cm.restaurant_id
+    ),
+
+    -- Количество проданных блюд
+    product_stats as (
+        select d.restaurant_id,
+               os.product_id,
+               sum(os.quantity) as total_quantity
+        from delivered_orders d
+        join order_structure os
+            on os.order_id = d.order_id
+        group by d.restaurant_id, os.product_id
+    ),
+
+    -- Определение максимального количества продаж
+    product_max as (
+        select ps.*,
+               max(ps.total_quantity) over (
+                   partition by ps.restaurant_id
+               ) as max_quantity
+        from product_stats ps
+    ),
+
+    -- Кандидаты на самое покупаемое блюдо
+    best_products as (
+        select pm.restaurant_id,
+               array_agg(pm.product_id) filter (
+                   where pm.total_quantity = pm.max_quantity
+               ) as best_product_ids
+        from product_max pm
+        group by pm.restaurant_id
+    ),
+
+    -- Выбор победителей без случайной сортировки
+    selected as materialized (
+        select r.restaurant_name,
+               rs.total_amount,
+               rs.avg_amount,
+
+               case
+                   when cardinality(rs.best_client_ids) > 1
+                   then rs.best_client_ids[
+                       1 + floor(
+                           random() * cardinality(rs.best_client_ids)
+                       )::int
+                   ]
+                   else rs.best_client_ids[1]
+               end as client_id,
+
+               case
+                   when cardinality(bp.best_product_ids) > 1
+                   then bp.best_product_ids[
+                       1 + floor(
+                           random() * cardinality(bp.best_product_ids)
+                       )::int
+                   ]
+                   else bp.best_product_ids[1]
+               end as product_id
+
+        from restaurant r
+        left join restaurant_stats rs
+            on rs.restaurant_id = r.restaurant_id
+        left join best_products bp
+            on bp.restaurant_id = r.restaurant_id
     )
-    select r.restaurant_name,
-           bp.product_name,
-           t.total_amount,
-           t.avg_amount,
-           bu.login
-    from restaurant r
-    left join totals t on t.restaurant_id = r.restaurant_id
-    left join bp       on bp.restaurant_id = r.restaurant_id
-    left join bu       on bu.restaurant_id = r.restaurant_id;
+
+    select s.restaurant_name,
+           p.product_name as best_product_name,
+           s.total_amount,
+           s.avg_amount,
+           c.login as best_user
+    from selected s
+    left join product p on p.product_id = s.product_id
+    left join client c on c.client_id = s.client_id;
 $$;
