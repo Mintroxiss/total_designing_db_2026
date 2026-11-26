@@ -178,15 +178,14 @@ begin
             where o.status = 'доставлен' and (o.order_timestamp::date < c.hire_date
                 or o.delivery_timestamp::date > coalesce(c.dismissal_date, 'infinity'::date)))$q$);
 
-    -- Проверяет наличие одной попытки оплаты на заказ с учётом его статуса
-    perform pg_temp.expect_true(p_label || ': ровно одна попытка оплаты у каждого заказа',
+    perform pg_temp.expect_true(p_label || ': ровно одна попытка оплаты и она успешна',
         $q$select not exists (select 1 from "order" o left join payment p using (order_id)
-            group by o.order_id having count(p.payment_id) <> 1)$q$);
+            group by o.order_id having count(p.payment_id) <> 1
+                or count(*) filter (where p.status = 'успех') <> 1)$q$);
 
-    perform pg_temp.expect_true(p_label || ': статус попытки оплаты соответствует статусу заказа',
+    perform pg_temp.expect_true(p_label || ': заказ оплачен на полную сумму',
         $q$select not exists (select 1 from payment p join "order" o using (order_id)
-            where p.status is distinct from (case o.status when 'создан' then 'в_обработке'
-                when 'отменён' then 'ошибка' else 'успех' end)::payment_status)$q$);
+            where o.pay_status <> 'оплачен' or p.amount <> o.total_amount)$q$);
 
     -- Проверяет даты за шесть календарных месяцев
     perform pg_temp.expect_true(p_label || ': заказы в календарном окне, резерв 3 часа',
@@ -289,10 +288,10 @@ begin
     -- Проверяет полный набор значений enum при n от 5
     if n >= 5 then
         for r in select * from (values
-            ('payment','payment_type','payment_type'), ('payment','status','payment_status'),
+            ('payment','payment_type','payment_type'),
             ('product','status','product_status'), ('product','measure_unit','measure_unit'),
             ('restaurant','status','restaurant_status'), ('courier','status','courier_status'),
-            ('order','status','order_status'), ('order','pay_status','pay_status')
+            ('order','status','order_status')
         ) v(t,c,typ) loop
             perform pg_temp.expect_true(format('%s: все значения %s.%s в новой партии',p_label,r.t,r.c),
                 format($q$select not exists (select 1 from unnest(enum_range(null::shkuratetskiy_food.%I)) e

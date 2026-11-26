@@ -9,10 +9,15 @@ create or replace procedure shkuratetskiy_food.add_product(
     p_photo_url           text    default null,
     p_rating              numeric default null
 )
-language sql
+language plpgsql
 security definer
 set search_path = pg_catalog, pg_temp
 as $$
+begin
+    if p_rating is not null then
+        raise exception 'Рейтинг блюда рассчитывается по отзывам' using errcode = '23514';
+    end if;
+
     insert into shkuratetskiy_food.product (
         product_name,
         product_category_id,
@@ -21,8 +26,7 @@ as $$
         status,
         description,
         measure_unit,
-        photo_url,
-        rating
+        photo_url
     )
     values (
         p_product_name,
@@ -32,7 +36,7 @@ as $$
         p_status,
         p_description,
         p_measure_unit,
-        p_photo_url,
-        p_rating
+        p_photo_url
     );
+end;
 $$;

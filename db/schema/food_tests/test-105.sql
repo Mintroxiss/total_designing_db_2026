@@ -123,6 +123,38 @@ end;
 $$;
 
 
+do $$
+declare
+    r uuid := pg_temp.mk_rest();
+    c uuid;
+    p uuid;
+    o uuid;
+begin
+    insert into product_category(product_category_name)
+    values ('Тестовая категория') returning product_category_id into c;
+
+    begin
+        call add_product('Блюдо с заданным рейтингом', c, 1000, r, 'доступно', 'описание', 'шт', p_rating => 4.5);
+        insert into pg_temp.rating_test_result(test, ok) values ('add_product отклоняет заданный рейтинг', false);
+    exception when check_violation then
+        insert into pg_temp.rating_test_result(test, ok) values ('add_product отклоняет заданный рейтинг', true);
+    end;
+
+    call add_product('Новое блюдо', c, 1000, r, 'доступно', 'описание', 'шт');
+    select product_id into strict p
+    from product where restaurant_id = r and product_name = 'Новое блюдо';
+    perform pg_temp.expect_rating('add_product: рейтинг до первого отзыва', 'блюдо', p, null);
+
+    o := pg_temp.mk_order(pg_temp.mk_client_address(), r, array[p]);
+    perform pg_temp.mk_review(o, 'блюдо', p, 4);
+    perform pg_temp.expect_rating('add_product: рейтинг после первого отзыва', 'блюдо', p, 4.00);
+exception when others then
+    insert into pg_temp.rating_test_result(test, ok, details)
+    values ('add_product: ошибка сценария', false, sqlstate || ': ' || sqlerrm);
+end;
+$$;
+
+
 -- Проверяет рейтинг блюда и ресторана после вставки, изменения и удаления отзыва
 do $$
 declare

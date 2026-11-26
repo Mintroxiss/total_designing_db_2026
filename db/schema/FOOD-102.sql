@@ -200,10 +200,8 @@ begin
                        from generate_series(1, case when o.order_id is not null then 1 + floor(random() * 100)::int end)
                    ),
                    o.order_timestamp + random() * interval '10 minutes',
-                   case when u.st = 'создан' then pms[array_position(pms, 'в_обработке')]
-                        when u.st = 'отменён' then pms[array_position(pms, 'ошибка')]
-                        else pms[array_position(pms, 'успех')] end
-            from unnest(ords, sts) with ordinality u(id, st, i)
+                   pms[array_position(pms, 'успех')]
+            from unnest(ords) with ordinality u(id, i)
             join unnest(tmp) as pending(id) on pending.id = u.id
             join "order" o on o.order_id = u.id
             on conflict (transaction_id) do nothing
