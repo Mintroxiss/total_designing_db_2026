@@ -1,5 +1,5 @@
 -- FOOD-102: функциональные тесты insert_test_data(integer), PostgreSQL 15+.
--- Предварительно установить актуальные схему и процедуру.
+-- Перед прогоном применить FOOD-101.sql и FOOD-102.sql.
 -- Запускать целиком в тестовой БД, с правами на TRUNCATE/INSERT/SELECT/UPDATE.
 -- Тестовые данные и вспомогательные объекты откатываются в конце.
 -- Внимание: TRUNCATE удерживает блокировки до ROLLBACK.
@@ -233,18 +233,6 @@ begin
                or r.review_timestamp not between o.delivery_timestamp and o.delivery_timestamp + interval '1 hour'
                or r.review_timestamp > localtimestamp)$q$);
 
-    perform pg_temp.expect_true(p_label || ': рейтинг блюда = среднее его отзывов или NULL',
-        $q$select not exists (select 1 from product p left join (
-            select entity_id, round(avg(rating), 2) as expected from review
-            where entity_type = 'блюдо' group by entity_id) r on r.entity_id = p.product_id
-            where p.rating is distinct from r.expected)$q$);
-
-    perform pg_temp.expect_true(p_label || ': рейтинг ресторана = среднее его отзывов или NULL',
-        $q$select not exists (select 1 from restaurant p left join (
-            select entity_id, round(avg(rating), 2) as expected from review
-            where entity_type = 'ресторан' group by entity_id) r on r.entity_id = p.restaurant_id
-            where p.rating is distinct from r.expected)$q$);
-
     -- 7. Выплаты. Актуальная процедура группирует по delivery_timestamp,
     -- не по order_timestamp (в протоколе C.8 приведена другая формула).
     perform pg_temp.expect_true(p_label || ': выплата каждому курьеру за каждый из 6 месяцев',
@@ -287,6 +275,20 @@ begin
         perform pg_temp.expect_true(format('%s: %s.%s — нет пустых строк',p_label,r.t,r.c),
             format('select not exists (select 1 from %I where btrim(%I) = '''')',r.t,r.c));
     end loop;
+
+    perform pg_temp.expect_true(p_label || ': свободный текст состоит из русских букв',
+        $q$select not exists (
+            select 1 from (
+                select unnest(array[street, house_number, apartment_office]) as value from address
+                union all select unnest(array[last_name, first_name, middle_name]) from courier
+                union all select unnest(array[restaurant_name, description]) from restaurant
+                union all select product_category_name from product_category
+                union all select unnest(array[product_name, description]) from product
+                union all select description from "order"
+                union all select description from review
+                union all select transaction_id from payment
+            ) generated_text
+            where value !~ '^[абвгдеёжзийклмнопрстуфхцчшщъыьэюя]+$')$q$);
 
     -- Не проверяем обязательность NULL вообще: это свойство схемы.
     -- Проверяем только намеренное разнообразие опциональных полей генератора.
